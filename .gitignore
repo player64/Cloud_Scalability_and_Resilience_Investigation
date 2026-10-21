@@ -11,4 +11,7 @@ infra/crash.log
 infra/crash.*.log
 infra/*.auto.tfvars
 infra/*.auto.tfvars.json
+<<<<<<< ours
 infra/*.tfvars
+=======
+>>>>>>> theirs

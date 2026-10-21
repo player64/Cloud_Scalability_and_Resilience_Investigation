@@ -15,6 +15,20 @@ variable "aws_region" {
   nullable    = false
 }
 
+<<<<<<< ours
+=======
+variable "expected_account_id" {
+  description = "Twelve-digit AWS account ID allowed by the provider."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.expected_account_id))
+    error_message = "expected_account_id must contain exactly 12 digits."
+  }
+}
+
+>>>>>>> theirs
 variable "availability_zones" {
   description = "Two distinct Availability Zones in aws_region."
   type        = list(string)
