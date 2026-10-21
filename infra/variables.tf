@@ -158,3 +158,21 @@ variable "coupon_build_id" {
     error_message = "coupon_build_id may contain only letters, digits, dots, underscores and hyphens."
   }
 }
+
+variable "coupon_ami_id" {
+  description = "Pinned official Amazon Linux 2023 standard x86_64 AMI ID in aws_region; verify availability before deployment."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^ami-[0-9a-f]{17}$", var.coupon_ami_id))
+    error_message = "coupon_ami_id must be a literal AMI ID, not a moving latest-image reference."
+  }
+}
+
+variable "coupon_instance_type" {
+  description = "Approved x86_64 EC2 type for the fixed Coupon host."
+  type        = string
+  default     = "t3.micro"
+  nullable    = false
+}

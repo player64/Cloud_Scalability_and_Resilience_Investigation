@@ -97,3 +97,13 @@ output "application_log_group_name" {
   description = "CloudWatch log group for Product and Coupon application logs."
   value       = aws_cloudwatch_log_group.applications.name
 }
+
+output "coupon_instance_id" {
+  description = "Coupon EC2 ID for Session Manager."
+  value       = aws_instance.coupon.id
+}
+
+output "coupon_private_ip" {
+  description = "Coupon private address; keep the instance unchanged during experiments."
+  value       = aws_instance.coupon.private_ip
+}

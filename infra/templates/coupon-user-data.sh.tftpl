@@ -1,0 +1,77 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+install -d -m 0755 /var/log/ca1
+touch /var/log/ca1/coupon.log
+trap 'printf "%s\n" "Coupon bootstrap failed; inspect cloud-init status/logs locally." >> /var/log/ca1/coupon.log' ERR
+
+# Bound network retries; no secrets are handled by cloud-init.
+export AWS_DEFAULT_REGION='${region}' AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=5
+export AWS_PAGER=''
+dnf -y --setopt=timeout=30 --setopt=retries=3 install \
+  java-17-amazon-corretto-headless awscli-2 amazon-ssm-agent \
+  amazon-cloudwatch-agent mariadb1011 python3
+systemctl enable --now amazon-ssm-agent
+useradd --system --home-dir /opt/ca1 --shell /sbin/nologin coupon
+install -d -m 0755 /opt/ca1
+install -d -m 0700 /var/lib/ca1
+chown coupon:coupon /var/log/ca1 /var/log/ca1/coupon.log
+chmod 0750 /var/log/ca1
+chmod 0640 /var/log/ca1/coupon.log
+
+cat > /opt/ca1/cloudwatch.json <<'CW'
+{"logs":{"logs_collected":{"files":{"collect_list":[{"file_path":"/var/log/ca1/coupon.log","log_group_name":"${log_group}","log_stream_name":"{instance_id}/coupon"}]}}}}
+CW
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s -c file:/opt/ca1/cloudwatch.json
+systemctl enable amazon-cloudwatch-agent
+
+timeout 180 aws s3 cp 's3://${bucket}/${jar_key}' /opt/ca1/coupon.jar --only-show-errors
+printf '%s  %s\n' '${jar_sha256}' /opt/ca1/coupon.jar | sha256sum --check
+chmod 0644 /opt/ca1/coupon.jar
+curl --fail --silent --show-error --retry 3 --max-time 60 \
+  https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /opt/ca1/rds-ca.pem
+
+cat > /opt/ca1/config.json <<'CONFIG'
+${configuration}
+CONFIG
+cat > /opt/ca1/initialise.sql <<'SQL'
+${sql}
+SQL
+cat > /opt/ca1/coupon-operator.py <<'PYTHON'
+${runtime}
+PYTHON
+chmod 0700 /opt/ca1/coupon-operator.py
+
+cat > /etc/systemd/system/coupon.service <<'SERVICE'
+[Unit]
+Description=CA1 Coupon Service
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/var/lib/ca1/coupon-enabled
+StartLimitIntervalSec=900
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=coupon
+Group=coupon
+WorkingDirectory=/opt/ca1
+# Optional on the first ExecStartPre; reread before ExecStart after creation.
+EnvironmentFile=-/run/ca1-coupon/runtime.env
+ExecStartPre=+/usr/bin/python3 /opt/ca1/coupon-operator.py env
+ExecStart=/usr/bin/java -jar /opt/ca1/coupon.jar
+ExecStopPost=+/usr/bin/rm -f /run/ca1-coupon/runtime.env
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=180
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=append:/var/log/ca1/coupon.log
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+systemctl daemon-reload
+# Deliberately leave Coupon disabled and gated. No SQL or app start on boot.
+printf '%s\n' 'Coupon bootstrap complete; awaiting manual database verification and enablement.' >> /var/log/ca1/coupon.log
