@@ -1,6 +1,5 @@
 provider "aws" {
-  region              = var.aws_region
-  allowed_account_ids = [var.expected_account_id]
+  region = var.aws_region
 
   default_tags {
     tags = {
