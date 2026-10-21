@@ -102,3 +102,59 @@ variable "db_admin_password" {
     error_message = "db_admin_password must not contain a slash, double quote, at sign or space."
   }
 }
+
+variable "db_app_password" {
+  description = "Password for the application database user. Supply it through a protected input mechanism."
+  type        = string
+  sensitive   = true
+  nullable    = false
+
+  validation {
+    condition     = length(var.db_app_password) >= 8
+    error_message = "db_app_password must contain at least 8 characters."
+  }
+}
+
+variable "product_jar_path" {
+  description = "Path to the approved, existing Product Service JAR."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = length(trimspace(var.product_jar_path)) > 0
+    error_message = "product_jar_path must not be empty."
+  }
+}
+
+variable "coupon_jar_path" {
+  description = "Path to the approved, existing Coupon Service JAR."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = length(trimspace(var.coupon_jar_path)) > 0
+    error_message = "coupon_jar_path must not be empty."
+  }
+}
+
+variable "product_build_id" {
+  description = "Version-specific identifier for the Product Service build."
+  type        = string
+  default     = "0.0.1-SNAPSHOT"
+
+  validation {
+    condition     = can(regex("^[0-9A-Za-z._-]+$", var.product_build_id))
+    error_message = "product_build_id may contain only letters, digits, dots, underscores and hyphens."
+  }
+}
+
+variable "coupon_build_id" {
+  description = "Version-specific identifier for the Coupon Service build."
+  type        = string
+  default     = "0.0.1-SNAPSHOT"
+
+  validation {
+    condition     = can(regex("^[0-9A-Za-z._-]+$", var.coupon_build_id))
+    error_message = "coupon_build_id may contain only letters, digits, dots, underscores and hyphens."
+  }
+}

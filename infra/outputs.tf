@@ -47,3 +47,53 @@ output "rds_port" {
   description = "Port of the RDS MySQL instance."
   value       = aws_db_instance.main.port
 }
+
+output "artifact_bucket" {
+  description = "Name of the private S3 bucket containing application JARs."
+  value       = aws_s3_bucket.artifacts.id
+}
+
+output "product_jar_key" {
+  description = "Immutable S3 object key for the Product Service JAR."
+  value       = aws_s3_object.product_jar.key
+}
+
+output "product_jar_sha256" {
+  description = "SHA-256 checksum of the Product Service JAR."
+  value       = local.product_jar_sha256
+}
+
+output "coupon_jar_key" {
+  description = "Immutable S3 object key for the Coupon Service JAR."
+  value       = aws_s3_object.coupon_jar.key
+}
+
+output "coupon_jar_sha256" {
+  description = "SHA-256 checksum of the Coupon Service JAR."
+  value       = local.coupon_jar_sha256
+}
+
+output "product_iam_role_name" {
+  description = "Name of the Product Service EC2 IAM role."
+  value       = aws_iam_role.product.name
+}
+
+output "product_instance_profile_name" {
+  description = "Name of the Product Service EC2 instance profile."
+  value       = aws_iam_instance_profile.product.name
+}
+
+output "coupon_iam_role_name" {
+  description = "Name of the Coupon Service EC2 IAM role."
+  value       = aws_iam_role.coupon.name
+}
+
+output "coupon_instance_profile_name" {
+  description = "Name of the Coupon Service EC2 instance profile."
+  value       = aws_iam_instance_profile.coupon.name
+}
+
+output "application_log_group_name" {
+  description = "CloudWatch log group for Product and Coupon application logs."
+  value       = aws_cloudwatch_log_group.applications.name
+}
