@@ -98,12 +98,13 @@ resource "aws_launch_template" "product" {
   }
 
   user_data = base64encode(templatefile("${path.module}/templates/product-user-data.sh.tftpl", {
-    region     = var.aws_region
-    bucket     = aws_s3_bucket.artifacts.id
-    jar_key    = aws_s3_object.product_jar.key
-    jar_sha256 = local.product_jar_sha256
-    log_group  = aws_cloudwatch_log_group.applications.name
-    runtime    = file("${path.module}/scripts/product-runtime.py")
+    region          = var.aws_region
+    bucket          = aws_s3_bucket.artifacts.id
+    jar_key         = aws_s3_object.product_jar.key
+    jar_sha256      = local.product_jar_sha256
+    log_group       = aws_cloudwatch_log_group.applications.name
+    runtime         = file("${path.module}/scripts/product-runtime.py")
+    startup_timeout = var.product_startup_timeout_seconds
     configuration = jsonencode({
       region        = var.aws_region
       host          = aws_db_instance.main.address
@@ -129,16 +130,17 @@ resource "aws_launch_template" "product" {
 }
 
 resource "aws_autoscaling_group" "product" {
+  # Applying after elasticity intentionally resets desired capacity.
   name_prefix         = "${local.name_prefix}-product-"
-  min_size            = 1
-  desired_capacity    = 1
-  max_size            = 1
+  min_size            = var.product_min
+  desired_capacity    = var.product_desired
+  max_size            = var.product_max
   vpc_zone_identifier = [for subnet in aws_subnet.public : subnet.id]
   target_group_arns   = [aws_lb_target_group.product.arn]
 
   health_check_type         = "ELB"
-  health_check_grace_period = 600
-  default_instance_warmup   = 300
+  health_check_grace_period = var.product_health_check_grace_seconds
+  default_instance_warmup   = var.product_instance_warmup_seconds
   # Keep Launch/Terminate/HealthCheck/ReplaceUnhealthy enabled.
   suspended_processes = []
 
@@ -154,7 +156,7 @@ resource "aws_autoscaling_group" "product" {
     preferences {
       min_healthy_percentage = 0
       max_healthy_percentage = 100
-      instance_warmup        = 300
+      instance_warmup        = var.product_instance_warmup_seconds
       skip_matching          = true
     }
   }

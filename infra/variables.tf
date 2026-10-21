@@ -183,3 +183,104 @@ variable "product_instance_type" {
   default     = "t3.micro"
   nullable    = false
 }
+
+variable "product_min" {
+  description = "Minimum Product ASG capacity."
+  type        = number
+  default     = 1
+  nullable    = false
+
+  validation {
+    condition     = var.product_min == floor(var.product_min) && var.product_min >= 1 && var.product_min <= 2
+    error_message = "product_min must be an integer between 1 and 2."
+  }
+}
+
+variable "product_desired" {
+  description = "Terraform-managed desired Product capacity; do not apply during measurements."
+  type        = number
+  default     = 1
+  nullable    = false
+
+  validation {
+    condition     = var.product_desired == floor(var.product_desired) && var.product_desired >= 1 && var.product_desired <= 2
+    error_message = "product_desired must be an integer between 1 and 2."
+  }
+
+  validation {
+    condition     = var.product_min <= var.product_desired && var.product_desired <= var.product_max
+    error_message = "Product capacities must satisfy min <= desired <= max."
+  }
+}
+
+variable "product_max" {
+  description = "Maximum Product ASG capacity."
+  type        = number
+  default     = 1
+  nullable    = false
+
+  validation {
+    condition     = var.product_max == floor(var.product_max) && var.product_max >= 1 && var.product_max <= 2
+    error_message = "product_max must be an integer between 1 and 2."
+  }
+}
+
+variable "enable_product_scaling" {
+  description = "Enable CPU target tracking only for the elasticity experiment."
+  type        = bool
+  default     = false
+  nullable    = false
+
+  validation {
+    condition     = !var.enable_product_scaling || (var.product_min == 1 && var.product_desired == 1 && var.product_max == 2)
+    error_message = "Elasticity requires Product min=1, desired=1, max=2."
+  }
+}
+
+variable "product_cpu_target" {
+  description = "Target average Product ASG CPU utilisation percentage for elasticity."
+  type        = number
+  default     = 50
+  nullable    = false
+
+  validation {
+    condition     = var.product_cpu_target > 0 && var.product_cpu_target <= 100
+    error_message = "product_cpu_target must be greater than 0 and at most 100."
+  }
+}
+
+variable "product_startup_timeout_seconds" {
+  description = "Product systemd startup deadline; pre-start receives five seconds less. Preserve the existing dependency retry budget."
+  type        = number
+  default     = 185
+  nullable    = false
+
+  validation {
+    condition     = var.product_startup_timeout_seconds == floor(var.product_startup_timeout_seconds) && var.product_startup_timeout_seconds >= 185
+    error_message = "product_startup_timeout_seconds must be an integer of at least 185."
+  }
+}
+
+variable "product_health_check_grace_seconds" {
+  description = "ASG ELB health-check grace period in seconds."
+  type        = number
+  default     = 600
+  nullable    = false
+
+  validation {
+    condition     = var.product_health_check_grace_seconds == floor(var.product_health_check_grace_seconds) && var.product_health_check_grace_seconds >= 0
+    error_message = "product_health_check_grace_seconds must be a non-negative integer."
+  }
+}
+
+variable "product_instance_warmup_seconds" {
+  description = "Default ASG and rolling refresh warmup in seconds; target tracking inherits this value."
+  type        = number
+  default     = 300
+  nullable    = false
+
+  validation {
+    condition     = var.product_instance_warmup_seconds == floor(var.product_instance_warmup_seconds) && var.product_instance_warmup_seconds >= 0
+    error_message = "product_instance_warmup_seconds must be a non-negative integer."
+  }
+}

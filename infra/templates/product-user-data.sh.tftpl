@@ -54,12 +54,12 @@ Group=product
 WorkingDirectory=/opt/ca1
 # systemd rereads this before ExecStart after the privileged pre-start creates it.
 EnvironmentFile=-/run/ca1-product/runtime.env
-ExecStartPre=+/usr/bin/timeout 180 /usr/bin/python3 /opt/ca1/product-runtime.py
+ExecStartPre=+/usr/bin/timeout ${startup_timeout - 5} /usr/bin/python3 /opt/ca1/product-runtime.py
 ExecStart=/usr/bin/java -jar /opt/ca1/product.jar
 ExecStopPost=+/usr/bin/rm -f /run/ca1-product/runtime.env
 Restart=on-failure
 RestartSec=10
-TimeoutStartSec=185
+TimeoutStartSec=${startup_timeout}
 TimeoutStopSec=30
 StandardOutput=journal
 StandardError=append:/var/log/ca1/product.log
