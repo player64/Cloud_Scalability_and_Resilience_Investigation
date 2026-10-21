@@ -1,0 +1,72 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+install -d -m 0755 /var/log/ca1
+touch /var/log/ca1/product.log
+trap 'printf "%s\n" "Product bootstrap failed; inspect cloud-init status/logs locally." >> /var/log/ca1/product.log' ERR
+
+# No secrets pass through cloud-init. Runtime retrieval uses the instance role.
+export AWS_DEFAULT_REGION='${region}' AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=5
+export AWS_PAGER=''
+dnf -y --setopt=timeout=30 --setopt=retries=3 install \
+  java-17-amazon-corretto-headless awscli-2 amazon-ssm-agent \
+  amazon-cloudwatch-agent mariadb1011 python3
+systemctl enable --now amazon-ssm-agent
+useradd --system --home-dir /opt/ca1 --shell /sbin/nologin product
+install -d -m 0755 /opt/ca1
+chown product:product /var/log/ca1 /var/log/ca1/product.log
+chmod 0750 /var/log/ca1
+chmod 0640 /var/log/ca1/product.log
+
+cat > /opt/ca1/cloudwatch.json <<'CW'
+{"logs":{"logs_collected":{"files":{"collect_list":[{"file_path":"/var/log/ca1/product.log","log_group_name":"${log_group}","log_stream_name":"{instance_id}/product"}]}}}}
+CW
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s -c file:/opt/ca1/cloudwatch.json
+systemctl enable amazon-cloudwatch-agent
+
+timeout 180 aws s3 cp 's3://${bucket}/${jar_key}' /opt/ca1/product.jar --only-show-errors
+printf '%s  %s\n' '${jar_sha256}' /opt/ca1/product.jar | sha256sum --check
+chmod 0644 /opt/ca1/product.jar
+timeout 180 curl --fail --silent --show-error --retry 3 --max-time 45 \
+  https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /opt/ca1/rds-ca.pem
+
+cat > /opt/ca1/product-config.json <<'CONFIG'
+${configuration}
+CONFIG
+cat > /opt/ca1/product-runtime.py <<'PYTHON'
+${runtime}
+PYTHON
+chmod 0700 /opt/ca1/product-runtime.py
+
+cat > /etc/systemd/system/product.service <<'SERVICE'
+[Unit]
+Description=CA1 Product Service
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=900
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=product
+Group=product
+WorkingDirectory=/opt/ca1
+# systemd rereads this before ExecStart after the privileged pre-start creates it.
+EnvironmentFile=-/run/ca1-product/runtime.env
+ExecStartPre=+/usr/bin/timeout 180 /usr/bin/python3 /opt/ca1/product-runtime.py
+ExecStart=/usr/bin/java -jar /opt/ca1/product.jar
+ExecStopPost=+/usr/bin/rm -f /run/ca1-product/runtime.env
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=185
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=append:/var/log/ca1/product.log
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+systemctl daemon-reload
+systemctl enable --now product
+printf '%s\n' 'Product bootstrap complete; ALB readiness checks determine application health.' >> /var/log/ca1/product.log

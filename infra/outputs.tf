@@ -107,3 +107,28 @@ output "coupon_private_ip" {
   description = "Coupon private address; keep the instance unchanged during experiments."
   value       = aws_instance.coupon.private_ip
 }
+
+output "alb_url" {
+  description = "Product HTTP URL, reachable from the approved client CIDRs."
+  value       = "http://${aws_lb.product.dns_name}"
+}
+
+output "target_group_arn" {
+  description = "Product target group ARN for health verification."
+  value       = aws_lb_target_group.product.arn
+}
+
+output "product_asg_name" {
+  description = "Name of the baseline Product Auto Scaling Group."
+  value       = aws_autoscaling_group.product.name
+}
+
+output "product_launch_template_id" {
+  description = "ID of the Product Launch Template."
+  value       = aws_launch_template.product.id
+}
+
+output "product_launch_template_version" {
+  description = "Numeric Product Launch Template version used by the ASG."
+  value       = aws_launch_template.product.latest_version
+}

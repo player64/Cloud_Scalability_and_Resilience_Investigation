@@ -176,3 +176,10 @@ variable "coupon_instance_type" {
   default     = "t3.micro"
   nullable    = false
 }
+
+variable "product_instance_type" {
+  description = "Approved x86_64 EC2 type for Product instances; keep fixed across experiments."
+  type        = string
+  default     = "t3.micro"
+  nullable    = false
+}
