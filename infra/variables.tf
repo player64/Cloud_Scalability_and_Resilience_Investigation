@@ -74,3 +74,31 @@ variable "allowed_client_cidrs" {
     error_message = "allowed_client_cidrs must not permit all IPv4 addresses."
   }
 }
+
+variable "db_instance_class" {
+  description = "RDS instance class approved for MySQL in the selected region."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = startswith(var.db_instance_class, "db.")
+    error_message = "db_instance_class must be an RDS class name beginning with db."
+  }
+}
+
+variable "db_admin_password" {
+  description = "Administrator password for the RDS MySQL instance. Supply it through a protected input mechanism."
+  type        = string
+  sensitive   = true
+  nullable    = false
+
+  validation {
+    condition     = length(var.db_admin_password) >= 8 && length(var.db_admin_password) <= 41
+    error_message = "db_admin_password must be between 8 and 41 characters."
+  }
+
+  validation {
+    condition     = length(regexall("[/@\" ]", var.db_admin_password)) == 0
+    error_message = "db_admin_password must not contain a slash, double quote, at sign or space."
+  }
+}

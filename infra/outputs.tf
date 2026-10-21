@@ -32,3 +32,18 @@ output "database_security_group_id" {
   description = "Security group ID for the future private database."
   value       = aws_security_group.database.id
 }
+
+output "rds_identifier" {
+  description = "Identifier of the RDS MySQL instance."
+  value       = aws_db_instance.main.identifier
+}
+
+output "rds_address" {
+  description = "Hostname of the RDS MySQL instance."
+  value       = aws_db_instance.main.address
+}
+
+output "rds_port" {
+  description = "Port of the RDS MySQL instance."
+  value       = aws_db_instance.main.port
+}
