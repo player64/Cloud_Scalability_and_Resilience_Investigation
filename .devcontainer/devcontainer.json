@@ -1,0 +1,16 @@
+{
+  "name": "CA1 Terraform",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "vscode",
+  "workspaceFolder": "/workspaces/ca1",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/ca1,type=bind",
+  "containerEnv": {
+    "AWS_EC2_METADATA_DISABLED": "true",
+    "AWS_CONFIG_FILE": "/tmp/no-aws/config",
+    "AWS_SHARED_CREDENTIALS_FILE": "/tmp/no-aws/credentials",
+    "AWS_PROFILE": "isolated"
+  },
+  "mounts": []
+}
