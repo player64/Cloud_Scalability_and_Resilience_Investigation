@@ -1,3 +1,13 @@
 .idea
 ca1-mysql-data
 app/**/target
+
+# Terraform working data and local state
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/*.tfplan
+infra/crash.log
+infra/crash.*.log
+infra/*.auto.tfvars
+infra/*.auto.tfvars.json
