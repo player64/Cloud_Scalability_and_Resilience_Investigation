@@ -12,3 +12,8 @@ infra/crash.*.log
 infra/*.auto.tfvars
 infra/*.auto.tfvars.json
 infra/secrets.tfvars
+
+# Local experiment inputs and raw evidence (retain separate backups).
+/evidence/
+/load-tests/**/*.local.json
+/load-tests/*.local.json
