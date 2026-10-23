@@ -4,10 +4,22 @@ import argparse
 import csv
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TypedDict
 
 
 PERIOD_SECONDS = 60
 CSV_FIELDS = ("timestamp_utc", "resource_id", "metric", "statistic", "value", "unit")
+
+
+class MetricDefinition(TypedDict):
+    """The CloudWatch series to request and its CSV unit."""
+
+    namespace: str
+    metric: str
+    dimension: str
+    resource_id: str
+    statistic: str
+    unit: str
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -49,104 +61,150 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def metric_query(
-    query_id: str, namespace: str, metric: str, dimension: str,
-    resource_id: str, statistic: str,
-) -> dict:
+def metric_query(query_id: str, metric: MetricDefinition) -> dict:
     """Build a 60-second CloudWatch metric query."""
     return {
         "Id": query_id,
         "MetricStat": {
             "Metric": {
-                "Namespace": namespace,
-                "MetricName": metric,
-                "Dimensions": [{"Name": dimension, "Value": resource_id}],
+                "Namespace": metric["namespace"],
+                "MetricName": metric["metric"],
+                "Dimensions": [{
+                    "Name": metric["dimension"],
+                    "Value": metric["resource_id"],
+                }],
             },
             "Period": PERIOD_SECONDS,
-            "Stat": statistic,
+            "Stat": metric["statistic"],
         },
         "ReturnData": True,
     }
 
 
-def requested_metrics(args: argparse.Namespace) -> dict[str, list[tuple]]:
+def requested_metrics(args: argparse.Namespace) -> dict[str, list[MetricDefinition]]:
     """Describe the requested CSV files and their metric series."""
     files = {}
     if args.instances:
         files["ec2_cpu.csv"] = [
-            ("AWS/EC2", "CPUUtilization", "InstanceId", instance, "Average", "Percent")
+            {
+                "namespace": "AWS/EC2",
+                "metric": "CPUUtilization",
+                "dimension": "InstanceId",
+                "resource_id": instance,
+                "statistic": "Average",
+                "unit": "Percent",
+            }
             for instance in args.instances
         ]
     if args.alb:
         files["alb_metrics.csv"] = [
-            ("AWS/ApplicationELB", metric, "LoadBalancer", args.alb, statistic, unit)
-            for metric, statistic, unit in (
-                ("TargetResponseTime", "Average", "Seconds"),
-                ("TargetResponseTime", "p95", "Seconds"),
-                ("RequestCount", "Sum", "Count"),
-                ("HTTPCode_Target_5XX_Count", "Sum", "Count"),
+            {
+                "namespace": "AWS/ApplicationELB",
+                "metric": details["metric"],
+                "dimension": "LoadBalancer",
+                "resource_id": args.alb,
+                "statistic": details["statistic"],
+                "unit": details["unit"],
+            }
+            for details in (
+                {
+                    "metric": "TargetResponseTime",
+                    "statistic": "Average",
+                    "unit": "Seconds",
+                },
+                {
+                    "metric": "TargetResponseTime",
+                    "statistic": "p95",
+                    "unit": "Seconds",
+                },
+                {"metric": "RequestCount", "statistic": "Sum", "unit": "Count"},
+                {
+                    "metric": "HTTPCode_Target_5XX_Count",
+                    "statistic": "Sum",
+                    "unit": "Count",
+                },
             )
         ]
     if args.rds:
         files["rds_metrics.csv"] = [
-            (
-                "AWS/RDS", "CPUUtilization", "DBInstanceIdentifier",
-                args.rds, "Average", "Percent",
-            ),
-            (
-                "AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier",
-                args.rds, "Average", "Count",
-            ),
+            {
+                "namespace": "AWS/RDS",
+                "metric": "CPUUtilization",
+                "dimension": "DBInstanceIdentifier",
+                "resource_id": args.rds,
+                "statistic": "Average",
+                "unit": "Percent",
+            },
+            {
+                "namespace": "AWS/RDS",
+                "metric": "DatabaseConnections",
+                "dimension": "DBInstanceIdentifier",
+                "resource_id": args.rds,
+                "statistic": "Average",
+                "unit": "Count",
+            },
         ]
     return files
 
 
-def fetch_metrics(
-    client, definitions: list[tuple], start: datetime, end: datetime,
+def rows_from_response(
+    response: dict, metrics_by_id: dict[str, MetricDefinition],
 ) -> list[dict]:
-    """Fetch all pages of the requested metric series."""
+    """Validate a CloudWatch page and convert its datapoints to CSV rows."""
     rows = []
+    for result in response["MetricDataResults"]:
+        status = result.get("StatusCode")
+        if status not in (None, "Complete", "PartialData"):
+            raise RuntimeError(
+                f"CloudWatch returned {status} for query {result['Id']}"
+            )
+        if status == "PartialData" and not response.get("NextToken"):
+            raise RuntimeError(
+                f"CloudWatch returned incomplete data for query {result['Id']}"
+            )
+
+        metric = metrics_by_id[result["Id"]]
+        for timestamp, value in zip(result["Timestamps"], result["Values"]):
+            rows.append({
+                "timestamp_utc": timestamp.astimezone(timezone.utc).isoformat(),
+                "resource_id": metric["resource_id"],
+                "metric": metric["metric"],
+                "statistic": metric["statistic"],
+                "value": value,
+                "unit": metric["unit"],
+            })
+    return rows
+
+
+def fetch_metrics(
+    client, definitions: list[MetricDefinition], start: datetime, end: datetime,
+) -> list[dict]:
+    """Fetch and sort all pages of the requested metric series."""
+    rows = []
+    # GetMetricData accepts at most 500 queries per request.
     for offset in range(0, len(definitions), 500):
         batch = definitions[offset:offset + 500]
-        queries = [
-            metric_query(f"m{index}", *definition[:5])
-            for index, definition in enumerate(batch)
-        ]
-        next_token = None
-        while True:
-            request = {
-                "MetricDataQueries": queries,
-                "StartTime": start,
-                "EndTime": end,
-                "ScanBy": "TimestampAscending",
-            }
-            if next_token:
-                request["NextToken"] = next_token
-            response = client.get_metric_data(**request)
-            for result in response["MetricDataResults"]:
-                status = result.get("StatusCode")
-                if status not in (None, "Complete", "PartialData"):
-                    raise RuntimeError(
-                        f"CloudWatch returned {status} "
-                        f"for query {result['Id']}"
-                    )
-                if status == "PartialData" and not response.get("NextToken"):
-                    raise RuntimeError(
-                        f"CloudWatch returned incomplete data for query {result['Id']}"
-                    )
-                definition = batch[int(result["Id"][1:])]
-                for timestamp, value in zip(result["Timestamps"], result["Values"]):
-                    rows.append({
-                        "timestamp_utc": timestamp.astimezone(timezone.utc).isoformat(),
-                        "resource_id": definition[3],
-                        "metric": definition[1],
-                        "statistic": definition[4],
-                        "value": value,
-                        "unit": definition[5],
-                    })
+        metrics_by_id = {
+            f"m{index}": metric for index, metric in enumerate(batch)
+        }
+        request = {
+            "MetricDataQueries": [
+                metric_query(query_id, metric)
+                for query_id, metric in metrics_by_id.items()
+            ],
+            "StartTime": start,
+            "EndTime": end,
+            "ScanBy": "TimestampAscending",
+        }
+
+        response = client.get_metric_data(**request)
+        rows.extend(rows_from_response(response, metrics_by_id))
+        next_token = response.get("NextToken")
+        while next_token:
+            response = client.get_metric_data(**request, NextToken=next_token)
+            rows.extend(rows_from_response(response, metrics_by_id))
             next_token = response.get("NextToken")
-            if not next_token:
-                break
+
     return sorted(
         rows,
         key=lambda row: (
@@ -154,6 +212,43 @@ def fetch_metrics(
             row["metric"], row["statistic"],
         ),
     )
+
+
+def derived_alb_rows(rows: list[dict]) -> list[dict]:
+    """Calculate throughput and target 5xx percentage from ALB counts."""
+    requests = {}
+    target_errors = {}
+    derived = []
+
+    for row in rows:
+        key = (row["timestamp_utc"], row["resource_id"])
+        if row["metric"] == "RequestCount" and row["statistic"] == "Sum":
+            requests[key] = row["value"]
+            derived.append({
+                "timestamp_utc": row["timestamp_utc"],
+                "resource_id": row["resource_id"],
+                "metric": "Throughput",
+                "statistic": "Derived",
+                "value": row["value"] / PERIOD_SECONDS,
+                "unit": "Requests/Second",
+            })
+        elif row["metric"] == "HTTPCode_Target_5XX_Count" and row["statistic"] == "Sum":
+            target_errors[key] = row["value"]
+
+    for key, request_count in requests.items():
+        if request_count <= 0 or key not in target_errors:
+            continue
+        timestamp, resource_id = key
+        derived.append({
+            "timestamp_utc": timestamp,
+            "resource_id": resource_id,
+            "metric": "Target5XXErrorRate",
+            "statistic": "Derived",
+            "value": 100 * target_errors[key] / request_count,
+            "unit": "Percent",
+        })
+
+    return derived
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -186,6 +281,15 @@ def main() -> int:
             name: fetch_metrics(client, definitions, args.start, args.end)
             for name, definitions in files.items()
         }
+        if "alb_metrics.csv" in results:
+            alb_rows = results["alb_metrics.csv"]
+            results["alb_metrics.csv"] = sorted(
+                alb_rows + derived_alb_rows(alb_rows),
+                key=lambda row: (
+                    row["timestamp_utc"], row["resource_id"],
+                    row["metric"], row["statistic"],
+                ),
+            )
     except (BotoCoreError, ClientError) as error:
         raise SystemExit(f"CloudWatch request failed: {error}") from error
     except RuntimeError as error:
