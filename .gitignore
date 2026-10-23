@@ -11,10 +11,4 @@ infra/crash.log
 infra/crash.*.log
 infra/*.auto.tfvars
 infra/*.auto.tfvars.json
-infra/*.tfvars
-
-# Version only the four non-secret experiment profiles.
-!infra/baseline.tfvars
-!infra/scaled.tfvars
-!infra/elasticity.tfvars
-!infra/failure.tfvars
+infra/secrets.tfvars

@@ -19,8 +19,8 @@ resource "aws_db_instance" "main" {
   storage_type      = "gp3"
   storage_encrypted = true
 
-  db_name  = "servicedb"
-  username = "ca1admin"
+  db_name  = var.db_name
+  username = var.db_user
   password = var.db_admin_password
   port     = 3306
 

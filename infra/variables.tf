@@ -86,6 +86,34 @@ variable "db_instance_class" {
   }
 }
 
+variable "db_name" {
+  description = "Database name for the RDS MySQL instance"
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9]+$", var.db_name))
+    error_message = "Database name must contain only letters and numbers."
+  }
+}
+
+variable "db_user" {
+  description = "RDS MySQL master username"
+  type        = string
+  sensitive   = true
+  nullable    = false
+
+  validation {
+    condition = can(regex("^[a-zA-Z][a-zA-Z0-9]{0,15}$", var.db_user))
+    error_message = "Username must start with a letter, contain only alphanumeric characters, and be 1–16 characters long."
+  }
+
+  validation {
+    condition     = !contains(["root"], lower(var.db_user))
+    error_message = "Username cannot be a reserved MySQL username."
+  }
+}
+
 variable "db_admin_password" {
   description = "Administrator password for the RDS MySQL instance. Supply it through a protected input mechanism."
   type        = string
