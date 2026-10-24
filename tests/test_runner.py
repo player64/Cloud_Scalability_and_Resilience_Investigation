@@ -1,10 +1,12 @@
 """Offline acceptance tests for the baseline experiment runner."""
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -79,7 +81,7 @@ class RunnerTests(unittest.TestCase):
         )
 
     def run_workflow(self, k6_code=0, cloudwatch_code=0, valid_k6=True,
-                     valid_cloudwatch=True):
+                     valid_cloudwatch=True, cli_args=(), expected_workload=None):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             outputs = root / "outputs.json"
@@ -114,7 +116,8 @@ class RunnerTests(unittest.TestCase):
             with (patch.object(runner, "ROOT", root),
                   patch.object(runner, "discover_resources", return_value=RESOURCES),
                   patch.object(runner.subprocess, "run", side_effect=subprocess_result),
-                  patch.object(sys, "argv", [str(RUNNER_PATH), "baseline", "--outputs", str(outputs)])):
+                  patch.object(sys, "argv", [str(RUNNER_PATH), "baseline", "--outputs", str(outputs),
+                                             *cli_args])):
                 # setup_experiment, run_k6 and collect_cloudwatch remain real.
                 result = runner.main()
             after = datetime.now(timezone.utc)
@@ -125,7 +128,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(metadata["experiment"], "baseline")
             self.assertEqual(metadata["outputs_file"], str(outputs.resolve()))
             self.assertEqual(metadata["resources"], RESOURCES)
-            self.assertEqual(metadata["workload"], {
+            self.assertEqual(metadata["workload"], expected_workload or {
                 "script": "load-tests/product.js", "rate_per_second": runner.REQUEST_RATE,
                 "duration": runner.DURATION, "preallocated_vus": runner.VUS,
             })
@@ -156,6 +159,43 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(cloudwatch_exists)
         self.assertEqual((metadata["status"], metadata["k6_exit_code"],
                           metadata["cloudwatch_exit_code"]), ("completed", 0, 0))
+
+    def test_custom_workload_matches_command_and_metadata(self):
+        workload = {
+            "script": "load-tests/product.js", "rate_per_second": 12,
+            "duration": "5m", "preallocated_vus": 20,
+        }
+        result, calls, metadata, _ = self.run_workflow(
+            cli_args=("--rate", "12", "--duration", "5m", "--vus", "20"),
+            expected_workload=workload,
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(metadata["workload"], workload)
+        self.assertEqual([calls[0][index + 1] for index, value in enumerate(calls[0])
+                          if value == "-e"], [
+            f"ALB_URL={OUTPUTS['alb_url']}", "RATE=12", "DURATION=5m", "VUS=20",
+        ])
+
+    def test_invalid_workload_rejected_before_outputs_or_aws(self):
+        invalid = (("--rate", "0"), ("--rate", "1.5"),
+                   ("--duration", "0s"), ("--duration", "five minutes"),
+                   ("--vus", "-2"), ("--vus", "1.5"))
+        for arguments in invalid:
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with (patch.object(runner, "ROOT", root),
+                      patch.object(runner, "load_infrastructure_outputs") as outputs,
+                      patch.object(runner, "discover_resources") as discover,
+                      patch.object(runner.subprocess, "run") as process,
+                      patch.object(sys, "argv", [str(RUNNER_PATH), "baseline", *arguments]),
+                      redirect_stderr(io.StringIO())):
+                    with self.assertRaises(SystemExit) as exit_status:
+                        runner.main()
+                self.assertEqual(exit_status.exception.code, 2)
+                outputs.assert_not_called()
+                discover.assert_not_called()
+                process.assert_not_called()
+                self.assertFalse((root / "evidence").exists())
 
     def test_k6_failure_stops_before_cloudwatch(self):
         result, calls, metadata, cloudwatch_exists = self.run_workflow(k6_code=7)

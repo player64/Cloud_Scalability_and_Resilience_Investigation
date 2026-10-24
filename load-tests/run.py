@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,24 @@ EXPORTER = Path(__file__).with_name("cloudwatch.py")
 REQUEST_RATE = 1
 DURATION = "30s"
 VUS = 2
+
+
+def positive_integer(value: str) -> int:
+    """Parse a positive whole-number CLI value."""
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def k6_duration(value: str) -> str:
+    """Accept a positive k6 duration in seconds, minutes or hours."""
+    if not re.fullmatch(r"[1-9][0-9]*(?:s|m|h)", value):
+        raise argparse.ArgumentTypeError("must be a positive duration such as 30s, 5m or 1h")
+    return value
 
 
 def utc_now() -> datetime:
@@ -155,6 +174,7 @@ def valid_alb_evidence(path: Path, start: str, end: str) -> bool:
 
 def setup_experiment(
     outputs_path: Path, resources: dict[str, str],
+    rate: int = REQUEST_RATE, duration: str = DURATION, vus: int = VUS,
 ) -> tuple[Path, dict[str, Any]]:
     """Create a unique evidence directory and its initial metadata."""
     created = utc_now()
@@ -168,9 +188,9 @@ def setup_experiment(
         "resources": resources,
         "workload": {
             "script": "load-tests/product.js",
-            "rate_per_second": REQUEST_RATE,
-            "duration": DURATION,
-            "preallocated_vus": VUS,
+            "rate_per_second": rate,
+            "duration": duration,
+            "preallocated_vus": vus,
         },
         "created_utc": created.isoformat(),
         "test_start_utc": None,
@@ -187,12 +207,13 @@ def run_k6(
     directory: Path, resources: dict[str, str], metadata: dict[str, Any],
 ) -> bool:
     """Run k6 and save its output, UTC window and execution status."""
+    workload = metadata["workload"]
     command = [
         "k6", "run", "--out", f"csv={directory / 'k6.csv'}",
         "-e", f"ALB_URL={resources['alb_url']}",
-        "-e", f"RATE={REQUEST_RATE}",
-        "-e", f"DURATION={DURATION}",
-        "-e", f"VUS={VUS}",
+        "-e", f"RATE={workload['rate_per_second']}",
+        "-e", f"DURATION={workload['duration']}",
+        "-e", f"VUS={workload['preallocated_vus']}",
         str(WORKLOAD),
     ]
     try:
@@ -254,6 +275,12 @@ def main() -> int:
     """Coordinate one baseline run and report its evidence directory."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("experiment", choices=["baseline"])
+    parser.add_argument("--rate", type=positive_integer, default=REQUEST_RATE,
+                        help="requests per second (default: 1)")
+    parser.add_argument("--duration", type=k6_duration, default=DURATION,
+                        help="k6 duration, e.g. 30s or 5m (default: 30s)")
+    parser.add_argument("--vus", type=positive_integer, default=VUS,
+                        help="preallocated virtual users (default: 2)")
     parser.add_argument(
         "--outputs", type=Path, default=ROOT / "infra" / "outputs.json",
         help="JSON saved from terraform output -json",
@@ -266,7 +293,9 @@ def main() -> int:
     except (OSError, ValueError, KeyError, TypeError, ImportError) as error:
         parser.exit(1, f"Cannot prepare baseline run: {error}\n")
 
-    directory, metadata = setup_experiment(args.outputs, resources)
+    directory, metadata = setup_experiment(
+        args.outputs, resources, args.rate, args.duration, args.vus
+    )
     if not run_k6(directory, resources, metadata):
         print(directory)
         return 1
