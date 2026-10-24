@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKLOAD = Path(__file__).with_name("product.js")
 EXPORTER = Path(__file__).with_name("cloudwatch.py")
 REQUEST_RATE = 1
-DURATION = "10s"
+DURATION = "30s"
 VUS = 2
 
 

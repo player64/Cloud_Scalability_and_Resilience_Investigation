@@ -15,6 +15,9 @@ export const options = {
     },
   },
   maxRedirects: 0,
+  thresholds: {
+    checks: ['rate==1'],
+  },
 };
 
 http.setResponseCallback(http.expectedStatuses(200));
