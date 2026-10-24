@@ -6,7 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -91,19 +91,24 @@ class RunnerTests(unittest.TestCase):
             def subprocess_result(command, **kwargs):
                 calls.append(command)
                 if command[0] == "k6":
+                    kwargs["stdout"].write("k6 log\n")
+                    if k6_code == "error":
+                        raise RuntimeError("k6 runner crashed")
                     Path(command[command.index("--out") + 1][4:]).write_text(
                         "metric_name,timestamp,metric_value\n"
                         + ("checks,1792853968000,1\nhttp_req_duration,1792853968000,123\n"
                            if valid_k6 else "")
                     )
-                    kwargs["stdout"].write("k6 log\n")
                     return SimpleNamespace(returncode=k6_code)
                 if cloudwatch_code == "error":
                     raise OSError("CloudWatch export failed")
+                kwargs["stdout"].write("CloudWatch diagnostic\n")
                 target = Path(command[command.index("--output") + 1])
                 minute = datetime.fromisoformat(command[command.index("--start") + 1]).replace(
                     second=0, microsecond=0).isoformat()
                 for name in ("ec2_cpu.csv", "alb_metrics.csv", "rds_metrics.csv"):
+                    if valid_cloudwatch == "missing" and name == "rds_metrics.csv":
+                        continue
                     metric = "RequestCount,Sum,31,Count" if name == "alb_metrics.csv" else "CPUUtilization,Average,12,Percent"
                     (target / name).write_text(
                         "timestamp_utc,resource_id,metric,statistic,value,unit\n"
@@ -113,11 +118,13 @@ class RunnerTests(unittest.TestCase):
                 return SimpleNamespace(returncode=cloudwatch_code)
 
             before = datetime.now(timezone.utc)
+            terminal = io.StringIO()
             with (patch.object(runner, "ROOT", root),
                   patch.object(runner, "discover_resources", return_value=RESOURCES),
                   patch.object(runner.subprocess, "run", side_effect=subprocess_result),
                   patch.object(sys, "argv", [str(RUNNER_PATH), "baseline", "--outputs", str(outputs),
-                                             *cli_args])):
+                                             *cli_args]),
+                  redirect_stdout(terminal)):
                 # setup_experiment, run_k6 and collect_cloudwatch remain real.
                 result = runner.main()
             after = datetime.now(timezone.utc)
@@ -132,12 +139,23 @@ class RunnerTests(unittest.TestCase):
                 "script": "load-tests/product.js", "rate_per_second": runner.REQUEST_RATE,
                 "duration": runner.DURATION, "preallocated_vus": runner.VUS,
             })
-            self.assertTrue((evidence / "k6.csv").exists())
+            self.assertEqual((evidence / "k6.csv").exists(), k6_code != "error")
             self.assertEqual((evidence / "k6.txt").read_text(), "k6 log\n")
+            self.assertEqual((evidence / "cloudwatch.txt").read_text(),
+                             "" if cloudwatch_code == "error" else "CloudWatch diagnostic\n")
             times = [datetime.fromisoformat(metadata[key]) for key in
                      ("created_utc", "test_start_utc", "test_end_utc")]
             self.assertTrue(all(time.utcoffset().total_seconds() == 0 for time in times))
             self.assertTrue(before <= times[0] <= times[1] <= times[2] <= after)
+            summary = terminal.getvalue()
+            for value in ("Experiment: baseline", "k6: exit", "CloudWatch: exit",
+                          f"Status: {metadata['status']}", f"Evidence: {evidence}"):
+                self.assertIn(value, summary)
+            workload = metadata["workload"]
+            self.assertIn(
+                f"{workload['rate_per_second']} req/s | {workload['duration']} | "
+                f"{workload['preallocated_vus']} VUs", summary,
+            )
             return result, calls, metadata, (evidence / "ec2_cpu.csv").exists()
 
     def test_successful_workflow(self):
@@ -197,14 +215,16 @@ class RunnerTests(unittest.TestCase):
                 process.assert_not_called()
                 self.assertFalse((root / "evidence").exists())
 
-    def test_k6_failure_stops_before_cloudwatch(self):
+    def test_k6_failure_still_collects_cloudwatch(self):
         result, calls, metadata, cloudwatch_exists = self.run_workflow(k6_code=7)
         self.assertEqual(result, 1)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertEqual(metadata["status"], "failed")
         self.assertEqual(metadata["k6_exit_code"], 7)
-        self.assertIsNone(metadata["cloudwatch_exit_code"])
-        self.assertFalse(cloudwatch_exists)
+        self.assertEqual(metadata["cloudwatch_exit_code"], 0)
+        self.assertIn("k6 exited with code 7", metadata["workload_error"])
+        self.assertIsNone(metadata["cloudwatch_error"])
+        self.assertTrue(cloudwatch_exists)
 
     def test_cloudwatch_failure_preserves_partial_evidence(self):
         result, calls, metadata, cloudwatch_exists = self.run_workflow(cloudwatch_code="error")
@@ -213,7 +233,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(metadata["status"], "failed")
         self.assertEqual(metadata["k6_exit_code"], 0)
         self.assertIsNone(metadata["cloudwatch_exit_code"])
-        self.assertIn("CloudWatch export failed", metadata["error"])
+        self.assertIn("CloudWatch export failed", metadata["cloudwatch_error"])
         self.assertFalse(cloudwatch_exists)
 
     def test_empty_cloudwatch_csv_fails_even_with_zero_exit(self):
@@ -222,13 +242,41 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(exists)
         self.assertEqual(metadata["cloudwatch_exit_code"], 0)
         self.assertEqual(metadata["status"], "failed")
+        self.assertIn("CloudWatch evidence missing or incomplete", metadata["cloudwatch_error"])
+
+    def test_missing_required_cloudwatch_file_fails_even_with_zero_exit(self):
+        result, _, metadata, _ = self.run_workflow(valid_cloudwatch="missing")
+        self.assertEqual(result, 1)
+        self.assertEqual(metadata["cloudwatch_exit_code"], 0)
+        self.assertEqual(metadata["status"], "failed")
+        self.assertIn("rds_metrics.csv", metadata["cloudwatch_error"])
 
     def test_empty_k6_csv_fails_and_preserves_file(self):
         result, calls, metadata, exists = self.run_workflow(valid_k6=False)
         self.assertEqual(result, 1)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertEqual(metadata["status"], "failed")
-        self.assertFalse(exists)
+        self.assertIn("k6 CSV has no valid measurements", metadata["workload_error"])
+        self.assertTrue(exists)
+
+    def test_both_failures_are_recorded_independently(self):
+        result, calls, metadata, exists = self.run_workflow(k6_code=99, cloudwatch_code=4)
+        self.assertEqual(result, 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual((metadata["k6_exit_code"], metadata["cloudwatch_exit_code"]), (99, 4))
+        self.assertIn("k6 exited with code 99", metadata["workload_error"])
+        self.assertIn("CloudWatch export exited with code 4", metadata["cloudwatch_error"])
+        self.assertTrue(exists)
+
+    def test_unexpected_k6_exception_still_collects_cloudwatch(self):
+        result, calls, metadata, exists = self.run_workflow(k6_code="error")
+        self.assertEqual(result, 1)
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(metadata["k6_exit_code"])
+        self.assertEqual(metadata["cloudwatch_exit_code"], 0)
+        self.assertIn("k6 runner crashed", metadata["workload_error"])
+        self.assertIn("k6 CSV has no valid measurements", metadata["workload_error"])
+        self.assertTrue(exists)
 
     def test_runner_rejects_one_alb_period_from_cross_minute_run(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -252,6 +300,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(metadata["status"], "failed")
         self.assertEqual(metadata["cloudwatch_exit_code"], 1)
+        self.assertIn("CloudWatch export exited with code 1", metadata["cloudwatch_error"])
         self.assertTrue(exists)
 
     def test_zero_exit_with_one_period_cannot_complete_cross_minute_run(self):

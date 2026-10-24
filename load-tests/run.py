@@ -197,6 +197,8 @@ def setup_experiment(
         "test_end_utc": None,
         "k6_exit_code": None,
         "cloudwatch_exit_code": None,
+        "workload_error": None,
+        "cloudwatch_error": None,
         "status": "running",
     }
     save_metadata(directory, metadata)
@@ -224,17 +226,23 @@ def run_k6(
                 command, stdout=log, stderr=subprocess.STDOUT, check=False,
             )
             metadata["k6_exit_code"] = result.returncode
-    except OSError as error:
-        metadata["error"] = str(error)
+    except Exception as error:
+        metadata["workload_error"] = f"k6 execution failed: {error}"
     finally:
         if metadata["test_start_utc"] is not None:
             metadata["test_end_utc"] = utc_now().isoformat()
-        if metadata["k6_exit_code"] == 0 and not valid_k6_evidence(directory / "k6.csv"):
-            metadata["error"] = "k6 CSV has no valid measurements"
-        if metadata["k6_exit_code"] != 0 or "error" in metadata:
+        if metadata["k6_exit_code"] not in (None, 0):
+            metadata["workload_error"] = f"k6 exited with code {metadata['k6_exit_code']}"
+        if not valid_k6_evidence(directory / "k6.csv"):
+            reason = "k6 CSV has no valid measurements"
+            metadata["workload_error"] = (
+                f"{metadata['workload_error']}; {reason}"
+                if metadata["workload_error"] else reason
+            )
+        if metadata["k6_exit_code"] != 0 or metadata["workload_error"]:
             metadata["status"] = "failed"
         save_metadata(directory, metadata)
-    return metadata["status"] != "failed"
+    return metadata["k6_exit_code"] == 0 and not metadata["workload_error"]
 
 
 def collect_cloudwatch(
@@ -252,21 +260,38 @@ def collect_cloudwatch(
         "--rds", resources["rds_identifier"],
     ]
     try:
-        result = subprocess.run(command, check=False)
-        metadata["cloudwatch_exit_code"] = result.returncode
-    except OSError as error:
-        metadata["error"] = str(error)
+        with (directory / "cloudwatch.txt").open("w", encoding="utf-8") as log:
+            result = subprocess.run(
+                command, stdout=log, stderr=subprocess.STDOUT, check=False,
+            )
+            metadata["cloudwatch_exit_code"] = result.returncode
+    except Exception as error:
+        metadata["cloudwatch_error"] = f"CloudWatch export failed: {error}"
 
     expected = ("ec2_cpu.csv", "alb_metrics.csv", "rds_metrics.csv")
-    complete = metadata["cloudwatch_exit_code"] == 0 and all(
-        evidence_rows(directory / name,
-                      {"timestamp_utc", "resource_id", "metric", "statistic", "value", "unit"})
-        for name in expected
-    ) and valid_alb_evidence(directory / "alb_metrics.csv",
-                             metadata["test_start_utc"], metadata["test_end_utc"])
-    if metadata["cloudwatch_exit_code"] == 0 and not complete:
-        metadata["error"] = "CloudWatch CSV evidence is incomplete"
-    metadata["status"] = "completed" if complete else "failed"
+    missing = [
+        name for name in expected
+        if not evidence_rows(directory / name,
+                             {"timestamp_utc", "resource_id", "metric", "statistic", "value", "unit"})
+    ]
+    if not valid_alb_evidence(directory / "alb_metrics.csv",
+                              metadata["test_start_utc"], metadata["test_end_utc"]):
+        missing.append("ALB RequestCount periods")
+    complete = metadata["cloudwatch_exit_code"] == 0 and not missing
+    if metadata["cloudwatch_exit_code"] not in (None, 0):
+        metadata["cloudwatch_error"] = (
+            f"CloudWatch export exited with code {metadata['cloudwatch_exit_code']}"
+        )
+    if missing:
+        reason = f"CloudWatch evidence missing or incomplete: {', '.join(missing)}"
+        metadata["cloudwatch_error"] = (
+            f"{metadata['cloudwatch_error']}; {reason}"
+            if metadata.get("cloudwatch_error") else reason
+        )
+    metadata["status"] = (
+        "completed" if complete and metadata["k6_exit_code"] == 0
+        and not metadata.get("workload_error") else "failed"
+    )
     save_metadata(directory, metadata)
     return complete
 
@@ -296,12 +321,28 @@ def main() -> int:
     directory, metadata = setup_experiment(
         args.outputs, resources, args.rate, args.duration, args.vus
     )
-    if not run_k6(directory, resources, metadata):
-        print(directory)
-        return 1
-    succeeded = collect_cloudwatch(directory, resources, metadata)
-    print(directory)
-    return 0 if succeeded else 1
+    run_k6(directory, resources, metadata)
+    if (metadata["test_start_utc"] and metadata["test_end_utc"]
+            and datetime.fromisoformat(metadata["test_end_utc"])
+            > datetime.fromisoformat(metadata["test_start_utc"])):
+        collect_cloudwatch(directory, resources, metadata)
+    else:
+        metadata["cloudwatch_error"] = "CloudWatch export skipped: valid test timestamps unavailable"
+        metadata["status"] = "failed"
+        save_metadata(directory, metadata)
+
+    workload = metadata["workload"]
+    print(f"Experiment: {metadata['experiment']} | {workload['rate_per_second']} req/s | "
+          f"{workload['duration']} | {workload['preallocated_vus']} VUs")
+    k6_detail = f" ({metadata['workload_error']})" if metadata["workload_error"] else ""
+    cloudwatch_detail = (
+        f" ({metadata['cloudwatch_error']})" if metadata["cloudwatch_error"] else ""
+    )
+    print(f"k6: exit {metadata['k6_exit_code']}{k6_detail}")
+    print(f"CloudWatch: exit {metadata['cloudwatch_exit_code']}{cloudwatch_detail}")
+    print(f"Status: {metadata['status']}")
+    print(f"Evidence: {directory}")
+    return 0 if metadata["status"] == "completed" else 1
 
 
 if __name__ == "__main__":
