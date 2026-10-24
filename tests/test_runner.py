@@ -78,7 +78,8 @@ class RunnerTests(unittest.TestCase):
             TargetGroupArns=[OUTPUTS["target_group_arn"]]
         )
 
-    def run_workflow(self, k6_code=0, cloudwatch_code=0):
+    def run_workflow(self, k6_code=0, cloudwatch_code=0, valid_k6=True,
+                     valid_cloudwatch=True):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             outputs = root / "outputs.json"
@@ -88,12 +89,25 @@ class RunnerTests(unittest.TestCase):
             def subprocess_result(command, **kwargs):
                 calls.append(command)
                 if command[0] == "k6":
-                    Path(command[command.index("--out") + 1][4:]).write_text("partial k6 evidence\n")
+                    Path(command[command.index("--out") + 1][4:]).write_text(
+                        "metric_name,timestamp,metric_value\n"
+                        + ("checks,1792853968000,1\nhttp_req_duration,1792853968000,123\n"
+                           if valid_k6 else "")
+                    )
                     kwargs["stdout"].write("k6 log\n")
                     return SimpleNamespace(returncode=k6_code)
                 if cloudwatch_code == "error":
                     raise OSError("CloudWatch export failed")
-                (Path(command[command.index("--output") + 1]) / "cloudwatch.json").write_text("{}\n")
+                target = Path(command[command.index("--output") + 1])
+                minute = datetime.fromisoformat(command[command.index("--start") + 1]).replace(
+                    second=0, microsecond=0).isoformat()
+                for name in ("ec2_cpu.csv", "alb_metrics.csv", "rds_metrics.csv"):
+                    metric = "RequestCount,Sum,31,Count" if name == "alb_metrics.csv" else "CPUUtilization,Average,12,Percent"
+                    (target / name).write_text(
+                        "timestamp_utc,resource_id,metric,statistic,value,unit\n"
+                        + (f"{minute},resource,{metric}\n"
+                           if valid_cloudwatch else "")
+                    )
                 return SimpleNamespace(returncode=cloudwatch_code)
 
             before = datetime.now(timezone.utc)
@@ -121,7 +135,7 @@ class RunnerTests(unittest.TestCase):
                      ("created_utc", "test_start_utc", "test_end_utc")]
             self.assertTrue(all(time.utcoffset().total_seconds() == 0 for time in times))
             self.assertTrue(before <= times[0] <= times[1] <= times[2] <= after)
-            return result, calls, metadata, (evidence / "cloudwatch.json").exists()
+            return result, calls, metadata, (evidence / "ec2_cpu.csv").exists()
 
     def test_successful_workflow(self):
         result, calls, metadata, cloudwatch_exists = self.run_workflow()
@@ -161,6 +175,69 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNone(metadata["cloudwatch_exit_code"])
         self.assertIn("CloudWatch export failed", metadata["error"])
         self.assertFalse(cloudwatch_exists)
+
+    def test_empty_cloudwatch_csv_fails_even_with_zero_exit(self):
+        result, calls, metadata, exists = self.run_workflow(valid_cloudwatch=False)
+        self.assertEqual(result, 1)
+        self.assertTrue(exists)
+        self.assertEqual(metadata["cloudwatch_exit_code"], 0)
+        self.assertEqual(metadata["status"], "failed")
+
+    def test_empty_k6_csv_fails_and_preserves_file(self):
+        result, calls, metadata, exists = self.run_workflow(valid_k6=False)
+        self.assertEqual(result, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(metadata["status"], "failed")
+        self.assertFalse(exists)
+
+    def test_runner_rejects_one_alb_period_from_cross_minute_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "alb_metrics.csv"
+            path.write_text(
+                "timestamp_utc,resource_id,metric,statistic,value,unit\n"
+                "2026-10-24T15:13:00+00:00,app/product-alb/xyz,RequestCount,Sum,15,Count\n"
+            )
+            start = "2026-10-24T15:13:44.850369+00:00"
+            end = "2026-10-24T15:14:14.993027+00:00"
+            self.assertFalse(runner.valid_alb_evidence(path, start, end))
+            with path.open("a") as source:
+                source.write(
+                    "2026-10-24T15:14:00+00:00,app/product-alb/xyz,RequestCount,Sum,16,Count\n"
+                )
+            self.assertTrue(runner.valid_alb_evidence(path, start, end))
+
+    def test_incomplete_cloudwatch_export_keeps_failed_run_evidence(self):
+        result, calls, metadata, exists = self.run_workflow(cloudwatch_code=1)
+        self.assertEqual(result, 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(metadata["status"], "failed")
+        self.assertEqual(metadata["cloudwatch_exit_code"], 1)
+        self.assertTrue(exists)
+
+    def test_zero_exit_with_one_period_cannot_complete_cross_minute_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            metadata = {
+                "test_start_utc": "2026-10-24T15:13:44.850369+00:00",
+                "test_end_utc": "2026-10-24T15:14:14.993027+00:00",
+                "k6_exit_code": 0,
+                "cloudwatch_exit_code": None,
+                "status": "running",
+            }
+            for name in ("ec2_cpu.csv", "alb_metrics.csv", "rds_metrics.csv"):
+                metric = "RequestCount,Sum,15,Count" if name == "alb_metrics.csv" else "CPUUtilization,Average,12,Percent"
+                (directory / name).write_text(
+                    "timestamp_utc,resource_id,metric,statistic,value,unit\n"
+                    f"2026-10-24T15:13:00+00:00,resource,{metric}\n"
+                )
+            with patch.object(runner.subprocess, "run", return_value=SimpleNamespace(returncode=0)):
+                self.assertFalse(runner.collect_cloudwatch(directory, RESOURCES, metadata))
+            saved = json.loads((directory / "run.json").read_text())
+            self.assertEqual(saved["status"], "failed")
+            self.assertEqual(saved["cloudwatch_exit_code"], 0)
+            self.assertEqual(saved["test_start_utc"], metadata["test_start_utc"])
+            self.assertEqual(saved["test_end_utc"], metadata["test_end_utc"])
+            self.assertTrue((directory / "alb_metrics.csv").exists())
 
 
 if __name__ == "__main__":

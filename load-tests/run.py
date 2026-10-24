@@ -1,10 +1,11 @@
 """Run a baseline k6 experiment and export its CloudWatch metrics."""
 
 import argparse
+import csv
 import json
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +104,55 @@ def save_metadata(directory: Path, metadata: dict[str, Any]) -> None:
     )
 
 
+def evidence_rows(path: Path, required: set[str]) -> bool:
+    """Require a readable CSV with its schema and at least one measurement."""
+    try:
+        with path.open(newline="", encoding="utf-8") as source:
+            reader = csv.DictReader(source)
+            return required.issubset(reader.fieldnames or []) and any(
+                all(row.get(field) for field in required) for row in reader
+            )
+    except (OSError, csv.Error, UnicodeError):
+        return False
+
+
+def valid_k6_evidence(path: Path) -> bool:
+    """Require request samples and a passing response check."""
+    try:
+        with path.open(newline="", encoding="utf-8") as source:
+            reader = csv.DictReader(source)
+            if not {"metric_name", "timestamp", "metric_value"}.issubset(reader.fieldnames or []):
+                return False
+            metrics = {row["metric_name"] for row in reader
+                       if row.get("timestamp") and row.get("metric_value")}
+            return {"checks", "http_req_duration"}.issubset(metrics)
+    except (OSError, csv.Error, UnicodeError, KeyError):
+        return False
+
+
+def valid_alb_evidence(path: Path, start: str, end: str) -> bool:
+    """Require ALB request counts for every overlapping minute."""
+    period = datetime.fromisoformat(start).astimezone(timezone.utc).replace(second=0, microsecond=0)
+    last = datetime.fromisoformat(end).astimezone(timezone.utc).replace(second=0, microsecond=0)
+    expected = set()
+    while period <= last:
+        expected.add(period.isoformat())
+        period += timedelta(minutes=1)
+    try:
+        with path.open(newline="", encoding="utf-8") as source:
+            reader = csv.DictReader(source)
+            if not {"timestamp_utc", "resource_id", "metric", "statistic", "value", "unit"}.issubset(
+                reader.fieldnames or []
+            ):
+                return False
+            observed = {row["timestamp_utc"] for row in reader
+                        if row.get("metric") == "RequestCount"
+                        and row.get("statistic") == "Sum" and row.get("value")}
+            return expected.issubset(observed)
+    except (OSError, csv.Error, UnicodeError):
+        return False
+
+
 def setup_experiment(
     outputs_path: Path, resources: dict[str, str],
 ) -> tuple[Path, dict[str, Any]]:
@@ -158,10 +208,12 @@ def run_k6(
     finally:
         if metadata["test_start_utc"] is not None:
             metadata["test_end_utc"] = utc_now().isoformat()
-        if metadata["k6_exit_code"] != 0:
+        if metadata["k6_exit_code"] == 0 and not valid_k6_evidence(directory / "k6.csv"):
+            metadata["error"] = "k6 CSV has no valid measurements"
+        if metadata["k6_exit_code"] != 0 or "error" in metadata:
             metadata["status"] = "failed"
         save_metadata(directory, metadata)
-    return metadata["k6_exit_code"] == 0
+    return metadata["status"] != "failed"
 
 
 def collect_cloudwatch(
@@ -184,11 +236,18 @@ def collect_cloudwatch(
     except OSError as error:
         metadata["error"] = str(error)
 
-    metadata["status"] = (
-        "completed" if metadata["cloudwatch_exit_code"] == 0 else "failed"
-    )
+    expected = ("ec2_cpu.csv", "alb_metrics.csv", "rds_metrics.csv")
+    complete = metadata["cloudwatch_exit_code"] == 0 and all(
+        evidence_rows(directory / name,
+                      {"timestamp_utc", "resource_id", "metric", "statistic", "value", "unit"})
+        for name in expected
+    ) and valid_alb_evidence(directory / "alb_metrics.csv",
+                             metadata["test_start_utc"], metadata["test_end_utc"])
+    if metadata["cloudwatch_exit_code"] == 0 and not complete:
+        metadata["error"] = "CloudWatch CSV evidence is incomplete"
+    metadata["status"] = "completed" if complete else "failed"
     save_metadata(directory, metadata)
-    return metadata["cloudwatch_exit_code"] == 0
+    return complete
 
 
 def main() -> int:

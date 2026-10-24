@@ -2,12 +2,15 @@
 
 import argparse
 import csv
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict
 
 
 PERIOD_SECONDS = 60
+POLL_TIMEOUT_SECONDS = 300
+POLL_INTERVAL_SECONDS = 15
 CSV_FIELDS = ("timestamp_utc", "resource_id", "metric", "statistic", "value", "unit")
 
 
@@ -154,7 +157,7 @@ def rows_from_response(
     rows = []
     for result in response["MetricDataResults"]:
         status = result.get("StatusCode")
-        if status not in (None, "Complete", "PartialData"):
+        if status not in ("Complete", "PartialData"):
             raise RuntimeError(
                 f"CloudWatch returned {status} for query {result['Id']}"
             )
@@ -164,6 +167,8 @@ def rows_from_response(
             )
 
         metric = metrics_by_id[result["Id"]]
+        if len(result["Timestamps"]) != len(result["Values"]):
+            raise RuntimeError(f"CloudWatch returned mismatched datapoints for {result['Id']}")
         for timestamp, value in zip(result["Timestamps"], result["Values"]):
             rows.append({
                 "timestamp_utc": timestamp.astimezone(timezone.utc).isoformat(),
@@ -181,6 +186,9 @@ def fetch_metrics(
 ) -> list[dict]:
     """Fetch and sort all pages of the requested metric series."""
     rows = []
+    start = start.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    # EndTime is exclusive; include the bucket containing the actual end.
+    end = end.astimezone(timezone.utc).replace(second=0, microsecond=0) + timedelta(minutes=1)
     # GetMetricData accepts at most 500 queries per request.
     for offset in range(0, len(definitions), 500):
         batch = definitions[offset:offset + 500]
@@ -198,12 +206,17 @@ def fetch_metrics(
         }
 
         response = client.get_metric_data(**request)
+        seen = set()
+        seen.update(result["Id"] for result in response.get("MetricDataResults", []))
         rows.extend(rows_from_response(response, metrics_by_id))
         next_token = response.get("NextToken")
         while next_token:
             response = client.get_metric_data(**request, NextToken=next_token)
+            seen.update(result["Id"] for result in response.get("MetricDataResults", []))
             rows.extend(rows_from_response(response, metrics_by_id))
             next_token = response.get("NextToken")
+        if seen != metrics_by_id.keys():
+            raise RuntimeError(f"CloudWatch omitted metric results: {metrics_by_id.keys() - seen}")
 
     return sorted(
         rows,
@@ -259,6 +272,62 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+def export(client, files: dict[str, list[MetricDefinition]],
+           start: datetime, end: datetime, output: Path) -> dict[str, list[dict]]:
+    """Poll for active ALB request periods and retain partial CSVs on failure."""
+    expected = set()
+    period = start.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    last = end.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    while period <= last:
+        expected.add(period.isoformat())
+        period += timedelta(seconds=PERIOD_SECONDS)
+
+    collected = {name: {} for name in files}
+    deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
+    output.mkdir(parents=True, exist_ok=True)
+    try:
+        while True:
+            for name, definitions in files.items():
+                for row in fetch_metrics(client, definitions, start, end):
+                    key = (row["timestamp_utc"], row["resource_id"],
+                           row["metric"], row["statistic"])
+                    collected[name][key] = row
+            request_periods = {
+                row["timestamp_utc"] for row in collected.get("alb_metrics.csv", {}).values()
+                if row["metric"] == "RequestCount" and row["statistic"] == "Sum"
+            }
+            missing_periods = expected - request_periods if "alb_metrics.csv" in files else set()
+            missing_files = [name for name, rows in collected.items() if not rows]
+            # The final aggregate cannot be considered settled before its minute ends.
+            final_period_end = last + timedelta(seconds=PERIOD_SECONDS)
+            if (not missing_periods and not missing_files
+                    and datetime.now(timezone.utc) >= final_period_end):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "CloudWatch evidence incomplete; missing files: "
+                    f"{', '.join(missing_files)}; missing ALB RequestCount periods: "
+                    f"{', '.join(sorted(missing_periods))}"
+                )
+            time.sleep(min(POLL_INTERVAL_SECONDS, remaining))
+    finally:
+        results = {}
+        for name, unique in collected.items():
+            rows = sorted(unique.values(), key=lambda row: (
+                row["timestamp_utc"], row["resource_id"],
+                row["metric"], row["statistic"],
+            ))
+            if name == "alb_metrics.csv":
+                rows = sorted(rows + derived_alb_rows(rows), key=lambda row: (
+                    row["timestamp_utc"], row["resource_id"],
+                    row["metric"], row["statistic"],
+                ))
+            write_csv(output / name, rows)
+            results[name] = rows
+    return results
+
+
 def main() -> int:
     """Fetch requested metrics and write their CSV files."""
     args = parse_args()
@@ -277,32 +346,14 @@ def main() -> int:
 
     client = boto3.client("cloudwatch", region_name=args.region)
     try:
-        results = {
-            name: fetch_metrics(client, definitions, args.start, args.end)
-            for name, definitions in files.items()
-        }
-        if "alb_metrics.csv" in results:
-            alb_rows = results["alb_metrics.csv"]
-            results["alb_metrics.csv"] = sorted(
-                alb_rows + derived_alb_rows(alb_rows),
-                key=lambda row: (
-                    row["timestamp_utc"], row["resource_id"],
-                    row["metric"], row["statistic"],
-                ),
-            )
+        export(client, files, args.start, args.end, args.output)
     except (BotoCoreError, ClientError) as error:
         raise SystemExit(f"CloudWatch request failed: {error}") from error
     except RuntimeError as error:
         raise SystemExit(str(error)) from error
-
-    try:
-        args.output.mkdir(parents=True, exist_ok=True)
-        for name, rows in results.items():
-            write_csv(args.output / name, rows)
-    except FileExistsError as error:
-        raise SystemExit(f"output file already exists: {error.filename}") from error
     except OSError as error:
         raise SystemExit(f"could not write CSV files: {error}") from error
+
     return 0
 
 
