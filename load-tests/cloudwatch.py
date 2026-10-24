@@ -288,6 +288,8 @@ def export(client, files: dict[str, list[MetricDefinition]],
     try:
         while True:
             for name, definitions in files.items():
+                if name != "alb_metrics.csv" and collected[name]:
+                    continue
                 for row in fetch_metrics(client, definitions, start, end):
                     key = (row["timestamp_utc"], row["resource_id"],
                            row["metric"], row["statistic"])

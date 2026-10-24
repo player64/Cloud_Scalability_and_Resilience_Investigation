@@ -47,6 +47,39 @@ def response(request, values=None, status="Complete", token=None):
 
 
 class CloudWatchTests(unittest.TestCase):
+    def test_waiting_for_alb_does_not_refetch_ec2_or_rds(self):
+        start = datetime.fromisoformat("2026-10-24T15:13:44+00:00")
+        end = datetime.fromisoformat("2026-10-24T15:14:14+00:00")
+        first = datetime.fromisoformat("2026-10-24T15:13:00+00:00")
+        second = datetime.fromisoformat("2026-10-24T15:14:00+00:00")
+        files = cloudwatch.requested_metrics(SimpleNamespace(
+            instances=["i-product"], alb="app/product-alb/xyz", rds="product-db"))
+
+        class DelayedClient:
+            def __init__(self):
+                self.namespaces = []
+                self.alb_calls = 0
+
+            def get_metric_data(self, **request):
+                namespace = request["MetricDataQueries"][0]["MetricStat"]["Metric"]["Namespace"]
+                self.namespaces.append(namespace)
+                if namespace == "AWS/ApplicationELB":
+                    self.alb_calls += 1
+                stamps = [first, second] if self.alb_calls == 2 else [first]
+                return {"MetricDataResults": [
+                    {"Id": query["Id"], "StatusCode": "Complete",
+                     "Timestamps": stamps if namespace == "AWS/ApplicationELB" and index == 2 else [first],
+                     "Values": [1] * len(stamps) if namespace == "AWS/ApplicationELB" and index == 2 else [1]}
+                    for index, query in enumerate(request["MetricDataQueries"])
+                ]}
+
+        client = DelayedClient()
+        with tempfile.TemporaryDirectory() as temporary, patch.object(cloudwatch.time, "sleep"):
+            cloudwatch.export(client, files, start, end, Path(temporary))
+        self.assertEqual(client.namespaces, [
+            "AWS/EC2", "AWS/ApplicationELB", "AWS/RDS", "AWS/ApplicationELB",
+        ])
+
     def test_cross_minute_waits_for_second_request_count_and_writes_once(self):
         start = datetime.fromisoformat("2026-10-24T15:13:44.850369+00:00")
         end = datetime.fromisoformat("2026-10-24T15:14:14.993027+00:00")

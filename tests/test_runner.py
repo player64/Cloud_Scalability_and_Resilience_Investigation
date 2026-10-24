@@ -81,14 +81,18 @@ class RunnerTests(unittest.TestCase):
         )
 
     def run_workflow(self, k6_code=0, cloudwatch_code=0, valid_k6=True,
-                     valid_cloudwatch=True, cli_args=(), expected_workload=None):
+                     valid_cloudwatch=True, cli_args=(), expected_workload=None,
+                     alb_counts=(31,), refresh_error=False, clock=None,
+                     include_request_count=True):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             outputs = root / "outputs.json"
             write_outputs(outputs)
             calls = []
+            alb_exports = 0
 
             def subprocess_result(command, **kwargs):
+                nonlocal alb_exports
                 calls.append(command)
                 if command[0] == "k6":
                     kwargs["stdout"].write("k6 log\n")
@@ -97,22 +101,33 @@ class RunnerTests(unittest.TestCase):
                     Path(command[command.index("--out") + 1][4:]).write_text(
                         "metric_name,timestamp,metric_value\n"
                         + ("checks,1792853968000,1\nhttp_req_duration,1792853968000,123\n"
+                           "iterations,1792853968000,1\n"
+                           + ("http_reqs,1792853968000,31\n" if include_request_count else "")
                            if valid_k6 else "")
                     )
                     return SimpleNamespace(returncode=k6_code)
                 if cloudwatch_code == "error":
                     raise OSError("CloudWatch export failed")
+                if refresh_error and "--instances" not in command:
+                    kwargs["stdout"].write("CloudWatch API diagnostic\n")
+                    return SimpleNamespace(returncode=4)
                 kwargs["stdout"].write("CloudWatch diagnostic\n")
                 target = Path(command[command.index("--output") + 1])
+                alb_only = "--instances" not in command
+                count = alb_counts[min(alb_exports, len(alb_counts) - 1)]
+                alb_exports += 1
                 minute = datetime.fromisoformat(command[command.index("--start") + 1]).replace(
                     second=0, microsecond=0).isoformat()
                 for name in ("ec2_cpu.csv", "alb_metrics.csv", "rds_metrics.csv"):
+                    if alb_only and name != "alb_metrics.csv":
+                        continue
                     if valid_cloudwatch == "missing" and name == "rds_metrics.csv":
                         continue
-                    metric = "RequestCount,Sum,31,Count" if name == "alb_metrics.csv" else "CPUUtilization,Average,12,Percent"
+                    metric = f"RequestCount,Sum,{count},Count" if name == "alb_metrics.csv" else "CPUUtilization,Average,12,Percent"
+                    resource = RESOURCES["alb_dimension"] if name == "alb_metrics.csv" else "resource"
                     (target / name).write_text(
                         "timestamp_utc,resource_id,metric,statistic,value,unit\n"
-                        + (f"{minute},resource,{metric}\n"
+                        + (f"{minute},{resource},{metric}\n"
                            if valid_cloudwatch else "")
                     )
                 return SimpleNamespace(returncode=cloudwatch_code)
@@ -122,16 +137,23 @@ class RunnerTests(unittest.TestCase):
             with (patch.object(runner, "ROOT", root),
                   patch.object(runner, "discover_resources", return_value=RESOURCES),
                   patch.object(runner.subprocess, "run", side_effect=subprocess_result),
+                  patch.object(runner.time, "sleep", return_value=None),
                   patch.object(sys, "argv", [str(RUNNER_PATH), "baseline", "--outputs", str(outputs),
                                              *cli_args]),
                   redirect_stdout(terminal)):
                 # setup_experiment, run_k6 and collect_cloudwatch remain real.
-                result = runner.main()
+                if clock is None:
+                    result = runner.main()
+                else:
+                    with patch.object(runner.time, "monotonic", side_effect=clock):
+                        result = runner.main()
             after = datetime.now(timezone.utc)
             directories = list((root / "evidence").iterdir())
             self.assertEqual(len(directories), 1)
             evidence = directories[0]
             metadata = json.loads((evidence / "run.json").read_text())
+            self.last_evidence = {str(path.relative_to(evidence)): path.read_text()
+                                  for path in evidence.rglob("*") if path.is_file()}
             self.assertEqual(metadata["experiment"], "baseline")
             self.assertEqual(metadata["outputs_file"], str(outputs.resolve()))
             self.assertEqual(metadata["resources"], RESOURCES)
@@ -176,7 +198,67 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(cloudwatch[cloudwatch.index("--end") + 1], metadata["test_end_utc"])
         self.assertTrue(cloudwatch_exists)
         self.assertEqual((metadata["status"], metadata["k6_exit_code"],
-                          metadata["cloudwatch_exit_code"]), ("completed", 0, 0))
+                           metadata["cloudwatch_exit_code"]), ("completed", 0, 0))
+        self.assertEqual(metadata["reconciliation"], {
+            "status": "matched", "k6_requests": 31, "alb_requests": 31,
+            "difference": 0, "attempts": 1,
+        })
+        self.assertNotIn("reconciliation/", " ".join(self.last_evidence))
+
+    def test_mismatch_retries_alb_only_and_preserves_both_exports(self):
+        result, calls, metadata, _ = self.run_workflow(alb_counts=(29, 31))
+        self.assertEqual(result, 0)
+        self.assertEqual([call[0] for call in calls], ["k6", sys.executable, sys.executable])
+        self.assertEqual(sum(call[0] == "k6" for call in calls), 1)
+        self.assertNotIn("--instances", calls[2])
+        self.assertNotIn("--rds", calls[2])
+        self.assertEqual(metadata["reconciliation"], {
+            "status": "matched", "k6_requests": 31, "alb_requests": 31,
+            "difference": 0, "attempts": 2,
+        })
+        self.assertIn("RequestCount,Sum,29,Count",
+                      self.last_evidence["reconciliation/alb_metrics_attempt_1.csv"])
+        self.assertIn("RequestCount,Sum,31,Count", self.last_evidence["alb_metrics.csv"])
+        self.assertEqual(self.last_evidence["k6.csv"].count("http_reqs"), 1)
+        self.assertIn("ec2_cpu.csv", self.last_evidence)
+        self.assertIn("rds_metrics.csv", self.last_evidence)
+
+    def test_persistent_mismatch_times_out_and_preserves_latest_export(self):
+        result, calls, metadata, _ = self.run_workflow(
+            alb_counts=(29, 30), cli_args=("--reconcile-timeout", "2", "--reconcile-delay", "1"),
+            clock=iter([0, 0, 1, 1, 2]),
+        )
+        self.assertEqual(result, 1)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(metadata["status"], "failed")
+        self.assertEqual(metadata["reconciliation"], {
+            "status": "timeout", "k6_requests": 31, "alb_requests": 30,
+            "difference": -1, "attempts": 2,
+        })
+        self.assertIn("did not reconcile", metadata["cloudwatch_error"])
+        self.assertIn("RequestCount,Sum,30,Count", self.last_evidence["alb_metrics.csv"])
+
+    def test_refresh_failure_retains_diagnostic_and_original_export(self):
+        result, calls, metadata, _ = self.run_workflow(
+            alb_counts=(29,), refresh_error=True,
+        )
+        self.assertEqual(result, 1)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(metadata["reconciliation"]["status"], "unavailable")
+        self.assertEqual(metadata["reconciliation"]["attempts"], 2)
+        self.assertIn("ALB refresh exited with code 4", metadata["cloudwatch_error"])
+        self.assertIn("CloudWatch API diagnostic",
+                      self.last_evidence["reconciliation/attempt_2/cloudwatch.txt"])
+        self.assertIn("RequestCount,Sum,29,Count", self.last_evidence["alb_metrics.csv"])
+
+    def test_missing_request_counter_is_explicitly_unavailable(self):
+        result, calls, metadata, _ = self.run_workflow(include_request_count=False)
+        self.assertEqual(result, 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(metadata["reconciliation"]["status"], "unavailable")
+        self.assertIsNone(metadata["reconciliation"]["k6_requests"])
+        self.assertIn("k6.csv", self.last_evidence)
+        self.assertIsNone(metadata["workload_error"])
 
     def test_custom_workload_matches_command_and_metadata(self):
         workload = {
@@ -224,6 +306,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(metadata["cloudwatch_exit_code"], 0)
         self.assertIn("k6 exited with code 7", metadata["workload_error"])
         self.assertIsNone(metadata["cloudwatch_error"])
+        self.assertEqual(metadata["reconciliation"]["status"], "matched")
         self.assertTrue(cloudwatch_exists)
 
     def test_cloudwatch_failure_preserves_partial_evidence(self):

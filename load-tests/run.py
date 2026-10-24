@@ -4,8 +4,11 @@ import argparse
 import csv
 import json
 import re
+import shutil
 import subprocess
 import sys
+import time
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,8 @@ EXPORTER = Path(__file__).with_name("cloudwatch.py")
 REQUEST_RATE = 1
 DURATION = "30s"
 VUS = 2
+RECONCILE_TIMEOUT = 300
+RECONCILE_DELAY = 15
 
 
 def positive_integer(value: str) -> int:
@@ -149,6 +154,38 @@ def valid_k6_evidence(path: Path) -> bool:
         return False
 
 
+def k6_request_count(path: Path) -> int | None:
+    """Sum native k6 http_reqs counter samples, independently of iterations."""
+    try:
+        with path.open(newline="", encoding="utf-8") as source:
+            reader = csv.DictReader(source)
+            if not {"metric_name", "metric_value"}.issubset(reader.fieldnames or []):
+                return None
+            values = [Decimal(row["metric_value"]) for row in reader
+                      if row.get("metric_name") == "http_reqs"]
+        total = sum(values)
+        return int(total) if values and total >= 0 and total == int(total) else None
+    except (OSError, csv.Error, UnicodeError, InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def alb_request_count(path: Path, resource_id: str) -> int | None:
+    """Sum the selected ALB's RequestCount Sum datapoints only."""
+    try:
+        with path.open(newline="", encoding="utf-8") as source:
+            reader = csv.DictReader(source)
+            if not {"resource_id", "metric", "statistic", "value"}.issubset(reader.fieldnames or []):
+                return None
+            values = [Decimal(row["value"]) for row in reader
+                      if row.get("resource_id") == resource_id
+                      and row.get("metric") == "RequestCount"
+                      and row.get("statistic") == "Sum"]
+        total = sum(values)
+        return int(total) if values and total >= 0 and total == int(total) else None
+    except (OSError, csv.Error, UnicodeError, InvalidOperation, ValueError, TypeError):
+        return None
+
+
 def valid_alb_evidence(path: Path, start: str, end: str) -> bool:
     """Require ALB request counts for every overlapping minute."""
     period = datetime.fromisoformat(start).astimezone(timezone.utc).replace(second=0, microsecond=0)
@@ -199,6 +236,8 @@ def setup_experiment(
         "cloudwatch_exit_code": None,
         "workload_error": None,
         "cloudwatch_error": None,
+        "reconciliation": {"status": "pending", "k6_requests": None,
+                           "alb_requests": None, "difference": None, "attempts": 0},
         "status": "running",
     }
     save_metadata(directory, metadata)
@@ -288,12 +327,95 @@ def collect_cloudwatch(
             f"{metadata['cloudwatch_error']}; {reason}"
             if metadata.get("cloudwatch_error") else reason
         )
-    metadata["status"] = (
-        "completed" if complete and metadata["k6_exit_code"] == 0
-        and not metadata.get("workload_error") else "failed"
-    )
+    metadata["status"] = "running" if complete else "failed"
     save_metadata(directory, metadata)
     return complete
+
+
+def reconcile_requests(directory: Path, resources: dict[str, str],
+                       metadata: dict[str, Any], cloudwatch_complete: bool,
+                       timeout: int, delay: int) -> None:
+    """Refresh only ALB evidence until request totals agree or time runs out."""
+    result = metadata["reconciliation"]
+    result["attempts"] = 1
+    result["k6_requests"] = k6_request_count(directory / "k6.csv")
+    if result["k6_requests"] is None:
+        result["status"] = "unavailable"
+    if not cloudwatch_complete:
+        result["status"] = "unavailable"
+        metadata["status"] = "failed"
+        save_metadata(directory, metadata)
+        return
+
+    deadline = time.monotonic() + timeout
+    while True:
+        result["alb_requests"] = alb_request_count(
+            directory / "alb_metrics.csv", resources["alb_dimension"]
+        )
+        if result["k6_requests"] is not None and result["alb_requests"] is not None:
+            result["difference"] = result["alb_requests"] - result["k6_requests"]
+            if result["difference"] == 0:
+                result["status"] = "matched"
+                break
+        if result["k6_requests"] is None:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            result["status"] = "timeout"
+            break
+        time.sleep(min(delay, remaining))
+        if time.monotonic() >= deadline:
+            result["status"] = "timeout"
+            break
+
+        result["attempts"] += 1
+        attempts_dir = directory / "reconciliation"
+        attempt_dir = attempts_dir / f"attempt_{result['attempts']}"
+        try:
+            attempts_dir.mkdir(exist_ok=True)
+            if result["attempts"] == 2:
+                shutil.copy2(directory / "alb_metrics.csv", attempts_dir / "alb_metrics_attempt_1.csv")
+            attempt_dir.mkdir(exist_ok=False)
+            command = [
+                sys.executable, str(EXPORTER), "--region", resources["region"],
+                "--start", metadata["test_start_utc"],
+                "--end", metadata["test_end_utc"],
+                "--output", str(attempt_dir), "--alb", resources["alb_dimension"],
+            ]
+            with (attempt_dir / "cloudwatch.txt").open("w", encoding="utf-8") as log:
+                export = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
+                                        check=False, timeout=max(0.001, deadline - time.monotonic()))
+            if export.returncode != 0:
+                metadata["cloudwatch_error"] = (
+                    f"ALB refresh exited with code {export.returncode}; "
+                    f"see {attempt_dir / 'cloudwatch.txt'}"
+                )
+                result["status"] = "unavailable"
+                break
+            refreshed = attempt_dir / "alb_metrics.csv"
+            if not valid_alb_evidence(refreshed, metadata["test_start_utc"],
+                                      metadata["test_end_utc"]):
+                metadata["cloudwatch_error"] = f"ALB refresh has incomplete periods: {refreshed}"
+                result["status"] = "unavailable"
+                break
+            shutil.copy2(refreshed, directory / "alb_metrics.csv")
+        except subprocess.TimeoutExpired as error:
+            metadata["cloudwatch_error"] = f"ALB refresh timed out: {error}"
+            result["status"] = "timeout"
+            break
+        except OSError as error:
+            metadata["cloudwatch_error"] = f"ALB refresh failed: {error}"
+            result["status"] = "unavailable"
+            break
+
+    if result["status"] == "timeout" and not metadata["cloudwatch_error"]:
+        metadata["cloudwatch_error"] = "ALB RequestCount did not reconcile before timeout"
+    metadata["status"] = (
+        "completed" if result["status"] == "matched"
+        and metadata["k6_exit_code"] == 0 and not metadata["workload_error"]
+        and not metadata["cloudwatch_error"] else "failed"
+    )
+    save_metadata(directory, metadata)
 
 
 def main() -> int:
@@ -305,7 +427,11 @@ def main() -> int:
     parser.add_argument("--duration", type=k6_duration, default=DURATION,
                         help="k6 duration, e.g. 30s or 5m (default: 30s)")
     parser.add_argument("--vus", type=positive_integer, default=VUS,
-                        help="preallocated virtual users (default: 2)")
+                         help="preallocated virtual users (default: 2)")
+    parser.add_argument("--reconcile-timeout", type=positive_integer,
+                        default=RECONCILE_TIMEOUT, help="ALB reconciliation timeout in seconds")
+    parser.add_argument("--reconcile-delay", type=positive_integer,
+                        default=RECONCILE_DELAY, help="seconds between ALB refresh attempts")
     parser.add_argument(
         "--outputs", type=Path, default=ROOT / "infra" / "outputs.json",
         help="JSON saved from terraform output -json",
@@ -325,10 +451,13 @@ def main() -> int:
     if (metadata["test_start_utc"] and metadata["test_end_utc"]
             and datetime.fromisoformat(metadata["test_end_utc"])
             > datetime.fromisoformat(metadata["test_start_utc"])):
-        collect_cloudwatch(directory, resources, metadata)
+        cloudwatch_complete = collect_cloudwatch(directory, resources, metadata)
+        reconcile_requests(directory, resources, metadata, cloudwatch_complete,
+                           args.reconcile_timeout, args.reconcile_delay)
     else:
         metadata["cloudwatch_error"] = "CloudWatch export skipped: valid test timestamps unavailable"
         metadata["status"] = "failed"
+        metadata["reconciliation"]["status"] = "unavailable"
         save_metadata(directory, metadata)
 
     workload = metadata["workload"]
