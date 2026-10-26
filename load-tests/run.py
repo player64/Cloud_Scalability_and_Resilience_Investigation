@@ -1,4 +1,4 @@
-"""Run a baseline k6 experiment and export its CloudWatch metrics."""
+"""Run a Product experiment and export its CloudWatch metrics."""
 
 import argparse
 import csv
@@ -13,9 +13,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from experiments import EXPERIMENTS
+from observe import Observer
+
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKLOAD = Path(__file__).with_name("product.js")
+RAMP_WORKLOAD = Path(__file__).with_name("product-ramp.js")
 EXPORTER = Path(__file__).with_name("cloudwatch.py")
 REQUEST_RATE = 1
 DURATION = "30s"
@@ -61,64 +66,61 @@ def output_value(outputs: dict[str, Any], name: str) -> str:
 
 
 def load_infrastructure_outputs(path: Path) -> dict[str, str]:
-    """Load the Terraform outputs needed for a baseline run."""
+    """Load current infrastructure references and its applied profile label."""
     outputs = json.loads(path.read_text(encoding="utf-8"))
     return {
         "alb_url": output_value(outputs, "alb_url"),
         "product_asg_name": output_value(outputs, "product_asg_name"),
         "target_group_arn": output_value(outputs, "target_group_arn"),
         "rds_identifier": output_value(outputs, "rds_identifier"),
+        "experiment_profile": output_value(outputs, "experiment_profile"),
     }
 
 
-def discover_resources(infrastructure: dict[str, str]) -> dict[str, str]:
-    """Find the Product instance and ALB metric dimension using AWS."""
+def discover_resources(infrastructure: dict[str, str], experiment: str = "baseline") -> dict:
+    """Find Product members and check target health without inferring a profile."""
     import boto3
 
     target_group_arn = infrastructure["target_group_arn"]
     arn_parts = target_group_arn.split(":", 5)
-    if len(arn_parts) != 6 or arn_parts[2] != "elasticloadbalancing":
-        raise ValueError("target_group_arn is not an ELB ARN")
+    if len(arn_parts) != 6 or arn_parts[2] != "elasticloadbalancing" or not arn_parts[3]:
+        raise ValueError("target_group_arn is not a regional ELB ARN")
     region = arn_parts[3]
-    if not region:
-        raise ValueError("target_group_arn has no AWS region")
-
     session = boto3.Session(region_name=region)
     asg_name = infrastructure["product_asg_name"]
     groups = session.client("autoscaling").describe_auto_scaling_groups(
-        AutoScalingGroupNames=[asg_name]
-    )["AutoScalingGroups"]
+        AutoScalingGroupNames=[asg_name])["AutoScalingGroups"]
     if len(groups) != 1 or groups[0]["AutoScalingGroupName"] != asg_name:
         raise ValueError(f"Auto Scaling Group {asg_name!r} was not found")
+    instances = [item["InstanceId"] for item in groups[0]["Instances"]
+                 if item["LifecycleState"] == "InService"]
+    expected = EXPERIMENTS[experiment]["members"]
+    if len(instances) != expected:
+        raise ValueError(f"{experiment} requires {expected} InService Product instance(s); "
+                         f"found {len(instances)}")
 
-    instances = [
-        instance["InstanceId"] for instance in groups[0]["Instances"]
-        if instance["LifecycleState"] == "InService"
-    ]
-    if len(instances) != 1:
-        raise ValueError(
-            "baseline requires one InService Product instance; "
-            f"found {len(instances)}"
-        )
-
-    target_groups = session.client("elbv2").describe_target_groups(
-        TargetGroupArns=[target_group_arn]
-    )["TargetGroups"]
-    if (
-        len(target_groups) != 1
-        or len(target_groups[0]["LoadBalancerArns"]) != 1
-    ):
+    elbv2 = session.client("elbv2")
+    target_groups = elbv2.describe_target_groups(
+        TargetGroupArns=[target_group_arn])["TargetGroups"]
+    if len(target_groups) != 1 or len(target_groups[0]["LoadBalancerArns"]) != 1:
         raise ValueError("target group must belong to exactly one ALB")
     alb_arn = target_groups[0]["LoadBalancerArns"][0]
     if ":loadbalancer/app/" not in alb_arn:
         raise ValueError("target group load balancer is not an ALB")
 
-    return {
-        **infrastructure,
-        "region": region,
-        "product_instance_id": instances[0],
-        "alb_dimension": alb_arn.split(":loadbalancer/", 1)[1],
-    }
+    result = {**infrastructure, "region": region,
+              "product_instance_id": instances[0],
+              "alb_dimension": alb_arn.split(":loadbalancer/", 1)[1]}
+    if experiment != "baseline":
+        health = elbv2.describe_target_health(
+            TargetGroupArn=target_group_arn)["TargetHealthDescriptions"]
+        healthy = {item["Target"]["Id"] for item in health
+                   if item["TargetHealth"]["State"] == "healthy"}
+        if healthy != set(instances):
+            raise ValueError(f"{experiment} requires {expected} healthy InService targets; "
+                             f"found {len(healthy & set(instances))}")
+        result["product_instance_ids"] = sorted(instances)
+    return result
 
 
 def save_metadata(directory: Path, metadata: dict[str, Any]) -> None:
@@ -212,15 +214,16 @@ def valid_alb_evidence(path: Path, start: str, end: str) -> bool:
 def setup_experiment(
     outputs_path: Path, resources: dict[str, str],
     rate: int = REQUEST_RATE, duration: str = DURATION, vus: int = VUS,
+    experiment: str = "baseline", ramp: dict | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Create a unique evidence directory and its initial metadata."""
     created = utc_now()
     directory = ROOT / "evidence" / (
-        f"baseline-{created.strftime('%Y%m%dT%H%M%S%fZ')}"
+        f"{experiment}-{created.strftime('%Y%m%dT%H%M%S%fZ')}"
     )
     directory.mkdir(parents=True, exist_ok=False)
     metadata: dict[str, Any] = {
-        "experiment": "baseline",
+        "experiment": experiment,
         "outputs_file": str(outputs_path.resolve()),
         "resources": resources,
         "workload": {
@@ -240,6 +243,14 @@ def setup_experiment(
                            "alb_requests": None, "difference": None, "attempts": 0},
         "status": "running",
     }
+    metadata["provisioned_profile"] = resources["experiment_profile"]
+    if experiment != "baseline":
+        metadata["initial_instance_ids"] = resources["product_instance_ids"]
+        metadata["observation"] = {"status": "pending", "samples": 0,
+                                   "errors": 0, "instance_ids": []}
+    if ramp is not None:
+        metadata["workload"]["ramp"] = ramp
+        metadata["workload"]["script"] = "load-tests/product-ramp.js"
     save_metadata(directory, metadata)
     return directory, metadata
 
@@ -249,14 +260,29 @@ def run_k6(
 ) -> bool:
     """Run k6 and save its output, UTC window and execution status."""
     workload = metadata["workload"]
-    command = [
-        "k6", "run", "--out", f"csv={directory / 'k6.csv'}",
-        "-e", f"ALB_URL={resources['alb_url']}",
-        "-e", f"RATE={workload['rate_per_second']}",
-        "-e", f"DURATION={workload['duration']}",
-        "-e", f"VUS={workload['preallocated_vus']}",
-        str(WORKLOAD),
-    ]
+    command = ["k6", "run", "--out", f"csv={directory / 'k6.csv'}"]
+    if "ramp" in workload:
+        ramp = workload["ramp"]
+        command.extend(["-e", f"ALB_URL={resources['alb_url']}",
+                        "-e", f"VUS={workload['preallocated_vus']}"])
+        command.extend([item for key, value in (
+            ("LOW_RATE", ramp["low_rate_per_second"]),
+            ("HIGH_RATE", workload["rate_per_second"]),
+            ("PRE_DURATION", ramp["pre_duration"]),
+            ("RISE_DURATION", ramp["rise_duration"]),
+            ("HIGH_DURATION", workload["duration"]),
+            ("FALL_DURATION", ramp["fall_duration"]),
+            ("POST_DURATION", ramp["post_duration"]),
+        ) for item in ("-e", f"{key}={value}")])
+        command.append(str(RAMP_WORKLOAD))
+    else:
+        # Preserve the original baseline command and its environment ordering.
+        command.extend([
+            "-e", f"ALB_URL={resources['alb_url']}",
+            "-e", f"RATE={workload['rate_per_second']}",
+            "-e", f"DURATION={workload['duration']}",
+            "-e", f"VUS={workload['preallocated_vus']}", str(WORKLOAD),
+        ])
     metadata["k6_command"] = command
     metadata["k6_environment"] = {
         "ALB_URL": resources["alb_url"],
@@ -264,6 +290,15 @@ def run_k6(
         "DURATION": workload["duration"],
         "VUS": str(workload["preallocated_vus"]),
     }
+    if "ramp" in workload:
+        metadata["k6_environment"] = {
+            "ALB_URL": resources["alb_url"], "VUS": str(workload["preallocated_vus"]),
+            "LOW_RATE": str(ramp["low_rate_per_second"]),
+            "HIGH_RATE": str(workload["rate_per_second"]),
+            "PRE_DURATION": ramp["pre_duration"], "RISE_DURATION": ramp["rise_duration"],
+            "HIGH_DURATION": workload["duration"], "FALL_DURATION": ramp["fall_duration"],
+            "POST_DURATION": ramp["post_duration"],
+        }
     try:
         with (directory / "k6.txt").open("w", encoding="utf-8") as log:
             metadata["test_start_utc"] = utc_now().isoformat()
@@ -301,10 +336,12 @@ def collect_cloudwatch(
         "--start", metadata["test_start_utc"],
         "--end", metadata["test_end_utc"],
         "--output", str(directory),
-        "--instances", resources["product_instance_id"],
+        "--instances", *resources.get("product_instance_ids", [resources["product_instance_id"]]),
         "--alb", resources["alb_dimension"],
         "--rds", resources["rds_identifier"],
     ]
+    if metadata.get("experiment", "baseline") != "baseline":
+        command.append("--event-metrics")
     try:
         with (directory / "cloudwatch.txt").open("w", encoding="utf-8") as log:
             result = subprocess.run(
@@ -426,15 +463,21 @@ def reconcile_requests(directory: Path, resources: dict[str, str],
 
 
 def main() -> int:
-    """Coordinate one baseline run and report its evidence directory."""
+    """Coordinate a student-run trial and report its evidence directory."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("experiment", choices=["baseline"])
     parser.add_argument("--rate", type=positive_integer, default=REQUEST_RATE,
                         help="requests per second (default: 1)")
     parser.add_argument("--duration", type=k6_duration, default=DURATION,
                         help="k6 duration, e.g. 30s or 5m (default: 30s)")
     parser.add_argument("--vus", type=positive_integer, default=VUS,
                          help="preallocated virtual users (default: 2)")
+    parser.add_argument("--low-rate", type=positive_integer,
+                        help="elasticity low-stage iterations per second")
+    for option in ("pre-duration", "rise-duration", "fall-duration", "post-duration"):
+        parser.add_argument(f"--{option}", type=k6_duration,
+                            help="elasticity stage duration")
+    parser.add_argument("--observe-interval", type=positive_integer, default=15,
+                        help="event snapshot interval in seconds (default: 15)")
     parser.add_argument("--reconcile-timeout", type=positive_integer,
                         default=RECONCILE_TIMEOUT, help="ALB reconciliation timeout in seconds")
     parser.add_argument("--reconcile-delay", type=positive_integer,
@@ -444,22 +487,68 @@ def main() -> int:
         help="JSON saved from terraform output -json",
     )
     args = parser.parse_args()
-
     try:
         infrastructure = load_infrastructure_outputs(args.outputs)
-        resources = discover_resources(infrastructure)
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+        parser.exit(1, f"Cannot read infrastructure outputs: {error}\n")
+    experiment = infrastructure["experiment_profile"]
+    if experiment not in EXPERIMENTS:
+        parser.exit(1, f"Unsupported experiment_profile {experiment!r} in {args.outputs}\n")
+
+    ramp_names = ("low_rate", "pre_duration", "rise_duration", "fall_duration", "post_duration")
+    if experiment == "elasticity" and any(getattr(args, key) is None for key in ramp_names):
+        parser.error("elasticity requires --low-rate and all four stage-duration options")
+    if experiment != "elasticity" and any(getattr(args, key) is not None for key in ramp_names):
+        parser.error("ramp options are available only for elasticity")
+    ramp = ({"low_rate_per_second": args.low_rate, "pre_duration": args.pre_duration,
+             "rise_duration": args.rise_duration, "fall_duration": args.fall_duration,
+             "post_duration": args.post_duration} if experiment == "elasticity" else None)
+
+    try:
+        resources = discover_resources(infrastructure, experiment)
     except (OSError, ValueError, KeyError, TypeError, ImportError) as error:
-        parser.exit(1, f"Cannot prepare baseline run: {error}\n")
+        parser.exit(1, f"Cannot prepare {experiment} run: {error}\n")
 
     directory, metadata = setup_experiment(
-        args.outputs, resources, args.rate, args.duration, args.vus
+        args.outputs, resources, args.rate, args.duration, args.vus,
+        experiment, ramp,
     )
+    observer = None
+    if experiment != "baseline":
+        try:
+            import boto3
+            observer = Observer(boto3.Session(region_name=resources["region"]),
+                                resources["product_asg_name"], resources["target_group_arn"],
+                                directory / "aws_observations.jsonl", args.observe_interval)
+            observer.start()
+        except Exception as error:
+            metadata["status"] = "failed"
+            metadata["observation"] = {"status": "start_failed", "error": str(error),
+                                       "samples": 0, "errors": 0, "instance_ids": []}
+            save_metadata(directory, metadata)
+            print(f"AWS observation could not start: {type(error).__name__}; evidence: {directory}")
+            return 1
+        if experiment == "failure":
+            print("Failure injection is manual. Record action start/end UTC times and the selected "
+                  "instance ID in this evidence directory; the runner never terminates an instance.",
+                  flush=True)
     k6_succeeded = run_k6(directory, resources, metadata)
+    if observer is not None:
+        stopped = observer.stop()
+        metadata["observation"] = {
+            "status": "completed" if stopped and observer.samples and not observer.errors
+                      else "partial",
+            "samples": observer.samples, "errors": observer.errors,
+            "instance_ids": sorted(observer.seen_ids),
+        }
+        resources["product_instance_ids"] = sorted(
+            set(resources["product_instance_ids"]) | observer.seen_ids)
+        save_metadata(directory, metadata)
     if (metadata["test_start_utc"] and metadata["test_end_utc"]
             and datetime.fromisoformat(metadata["test_end_utc"])
             > datetime.fromisoformat(metadata["test_start_utc"])):
         cloudwatch_complete = collect_cloudwatch(directory, resources, metadata)
-        if k6_succeeded:
+        if k6_succeeded or experiment != "baseline":
             reconcile_requests(directory, resources, metadata, cloudwatch_complete,
                                args.reconcile_timeout, args.reconcile_delay)
         else:
@@ -471,6 +560,10 @@ def main() -> int:
         metadata["cloudwatch_error"] = "CloudWatch export skipped: valid test timestamps unavailable"
         metadata["status"] = "failed"
         metadata["reconciliation"]["status"] = "unavailable"
+        save_metadata(directory, metadata)
+
+    if observer is not None and metadata["observation"]["status"] != "completed":
+        metadata["status"] = "failed"
         save_metadata(directory, metadata)
 
     workload = metadata["workload"]

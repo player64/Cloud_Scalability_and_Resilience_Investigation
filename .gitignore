@@ -16,5 +16,6 @@ infra/outputs.json
 
 # Local experiment inputs and raw evidence (retain separate backups).
 /evidence/
+/evidence-*/
 /load-tests/**/*.local.json
 /load-tests/*.local.json

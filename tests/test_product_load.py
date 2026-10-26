@@ -13,11 +13,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 WORKLOAD = Path(__file__).resolve().parents[1] / "load-tests" / "product.js"
+RAMP_WORKLOAD = WORKLOAD.with_name("product-ramp.js")
 
 
 @unittest.skipUnless(shutil.which("k6"), "k6 is not installed")
 class ProductLoadTests(unittest.TestCase):
-    def run_workload(self, status):
+    def run_workload(self, status, ramp=False):
         requests = []
 
         class Handler(BaseHTTPRequestHandler):
@@ -42,9 +43,12 @@ class ProductLoadTests(unittest.TestCase):
                 csv_path = Path(directory) / "results.csv"
                 result = subprocess.run(
                     ["k6", "run", "--quiet", "--summary-export", str(summary_path),
-                     "--out", f"csv={csv_path}", str(WORKLOAD)],
+                      "--out", f"csv={csv_path}", str(RAMP_WORKLOAD if ramp else WORKLOAD)],
                     env={**os.environ, "ALB_URL": f"http://127.0.0.1:{server.server_port}/",
-                         "RATE": "2", "DURATION": "3s", "VUS": "2"},
+                         "RATE": "2", "DURATION": "3s", "VUS": "2",
+                         "LOW_RATE": "1", "HIGH_RATE": "2", "PRE_DURATION": "1s",
+                         "RISE_DURATION": "1s", "HIGH_DURATION": "1s",
+                         "FALL_DURATION": "1s", "POST_DURATION": "1s"},
                     capture_output=True, text=True, timeout=20,
                 )
                 self.assertTrue(summary_path.exists(), result.stderr)
@@ -93,6 +97,15 @@ class ProductLoadTests(unittest.TestCase):
         self.assertEqual(summary["metrics"]["checks"]["fails"], count)
         self.assertEqual(summary["metrics"]["http_req_failed"]["value"], 1)
         self.assertEqual(len([row for row in samples if row["metric_name"] == "http_req_duration"]), count)
+
+    def test_ramp_keeps_same_get_and_http_200_check(self):
+        result, requests, summary, samples = self.run_workload(200, ramp=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(requests)
+        self.assertEqual(set(requests), {("GET", "/productapi/products")})
+        self.assertEqual(summary["metrics"]["checks"]["passes"], len(requests))
+        self.assertEqual(summary["metrics"]["http_req_failed"]["value"], 0)
+        self.assertTrue(any(row["metric_name"] == "http_req_duration" for row in samples))
 
 
 if __name__ == "__main__":

@@ -56,6 +56,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--alb", help="ALB LoadBalancer dimension value")
     parser.add_argument("--rds", help="RDS DB instance identifier")
+    parser.add_argument("--event-metrics", action="store_true",
+                        help="also export ALB-originated 5xx for event experiments")
     args = parser.parse_args()
     if args.end <= args.start:
         parser.error("--end must be later than --start")
@@ -128,6 +130,15 @@ def requested_metrics(args: argparse.Namespace) -> dict[str, list[MetricDefiniti
                 },
             )
         ]
+        if getattr(args, "event_metrics", False):
+            files["alb_metrics.csv"].append({
+                "namespace": "AWS/ApplicationELB",
+                "metric": "HTTPCode_ELB_5XX_Count",
+                "dimension": "LoadBalancer",
+                "resource_id": args.alb,
+                "statistic": "Sum",
+                "unit": "Count",
+            })
     if args.rds:
         files["rds_metrics.csv"] = [
             {
@@ -273,7 +284,8 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def export(client, files: dict[str, list[MetricDefinition]],
-           start: datetime, end: datetime, output: Path) -> dict[str, list[dict]]:
+           start: datetime, end: datetime, output: Path,
+           refresh_all: bool = False) -> dict[str, list[dict]]:
     """Poll for active ALB request periods and retain partial CSVs on failure."""
     expected = set()
     period = start.astimezone(timezone.utc).replace(second=0, microsecond=0)
@@ -288,7 +300,7 @@ def export(client, files: dict[str, list[MetricDefinition]],
     try:
         while True:
             for name, definitions in files.items():
-                if name != "alb_metrics.csv" and collected[name]:
+                if name != "alb_metrics.csv" and collected[name] and not refresh_all:
                     continue
                 for row in fetch_metrics(client, definitions, start, end):
                     key = (row["timestamp_utc"], row["resource_id"],
@@ -348,7 +360,8 @@ def main() -> int:
 
     client = boto3.client("cloudwatch", region_name=args.region)
     try:
-        export(client, files, args.start, args.end, args.output)
+        export(client, files, args.start, args.end, args.output,
+               refresh_all=args.event_metrics)
     except (BotoCoreError, ClientError) as error:
         raise SystemExit(f"CloudWatch request failed: {error}") from error
     except RuntimeError as error:

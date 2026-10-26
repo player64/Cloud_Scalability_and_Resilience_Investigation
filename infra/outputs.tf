@@ -123,6 +123,11 @@ output "product_asg_name" {
   value       = aws_autoscaling_group.product.name
 }
 
+output "experiment_profile" {
+  description = "Experiment profile selected for this Terraform deployment."
+  value       = var.experiment_profile
+}
+
 output "product_launch_template_id" {
   description = "ID of the Product Launch Template."
   value       = aws_launch_template.product.id

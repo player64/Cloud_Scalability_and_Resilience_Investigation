@@ -23,6 +23,7 @@ OUTPUTS = {
     "product_asg_name": "product-asg",
     "target_group_arn": "arn:aws:elasticloadbalancing:eu-west-1:123:targetgroup/products/abc",
     "rds_identifier": "product-db",
+    "experiment_profile": "baseline",
 }
 RESOURCES = {
     **OUTPUTS,
@@ -44,7 +45,8 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(runner.load_infrastructure_outputs(path), OUTPUTS)
 
             for invalid in ({**OUTPUTS, "alb_url": ""},
-                            {key: value for key, value in OUTPUTS.items() if key != "target_group_arn"}):
+                            {key: value for key, value in OUTPUTS.items() if key != "target_group_arn"},
+                            {key: value for key, value in OUTPUTS.items() if key != "experiment_profile"}):
                 with self.subTest(invalid=invalid):
                     write_outputs(path, invalid)
                     with self.assertRaises(ValueError):
@@ -138,7 +140,7 @@ class RunnerTests(unittest.TestCase):
                   patch.object(runner, "discover_resources", return_value=RESOURCES),
                   patch.object(runner.subprocess, "run", side_effect=subprocess_result),
                   patch.object(runner.time, "sleep", return_value=None),
-                  patch.object(sys, "argv", [str(RUNNER_PATH), "baseline", "--outputs", str(outputs),
+                   patch.object(sys, "argv", [str(RUNNER_PATH), "--outputs", str(outputs),
                                              *cli_args]),
                   redirect_stdout(terminal)):
                 # setup_experiment, run_k6 and collect_cloudwatch remain real.
@@ -200,6 +202,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((metadata["status"], metadata["k6_exit_code"],
                            metadata["cloudwatch_exit_code"]), ("completed", 0, 0))
         self.assertEqual(metadata["k6_command"], k6)
+        self.assertEqual(metadata["provisioned_profile"], "baseline")
         self.assertEqual(metadata["k6_environment"], {
             "ALB_URL": OUTPUTS["alb_url"], "RATE": str(runner.REQUEST_RATE),
             "DURATION": runner.DURATION, "VUS": str(runner.VUS),
@@ -296,7 +299,7 @@ class RunnerTests(unittest.TestCase):
                       patch.object(runner, "load_infrastructure_outputs") as outputs,
                       patch.object(runner, "discover_resources") as discover,
                       patch.object(runner.subprocess, "run") as process,
-                      patch.object(sys, "argv", [str(RUNNER_PATH), "baseline", *arguments]),
+                       patch.object(sys, "argv", [str(RUNNER_PATH), *arguments]),
                       redirect_stderr(io.StringIO())):
                     with self.assertRaises(SystemExit) as exit_status:
                         runner.main()

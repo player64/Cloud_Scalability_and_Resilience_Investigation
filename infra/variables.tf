@@ -212,6 +212,17 @@ variable "product_instance_type" {
   nullable    = false
 }
 
+variable "experiment_profile" {
+  description = "Name of the applied coursework experiment profile."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = contains(["baseline", "scaled", "elasticity", "failure"], var.experiment_profile)
+    error_message = "experiment_profile must be baseline, scaled, elasticity or failure."
+  }
+}
+
 variable "product_min" {
   description = "Minimum Product ASG capacity."
   type        = number

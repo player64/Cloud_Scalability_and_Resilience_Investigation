@@ -273,6 +273,43 @@ class CloudWatchTests(unittest.TestCase):
             with (Path(temporary) / "ec2_cpu.csv").open(newline="") as source:
                 self.assertEqual(len(list(csv.DictReader(source))), 1)
 
+    def test_event_mode_adds_alb_originated_errors_without_changing_baseline(self):
+        baseline = cloudwatch.requested_metrics(SimpleNamespace(
+            instances=None, alb="app/product-alb/xyz", rds=None))
+        event = cloudwatch.requested_metrics(SimpleNamespace(
+            instances=None, alb="app/product-alb/xyz", rds=None, event_metrics=True))
+        self.assertEqual(len(baseline["alb_metrics.csv"]), 4)
+        self.assertEqual(len(event["alb_metrics.csv"]), 5)
+        self.assertEqual(event["alb_metrics.csv"][-1]["metric"], "HTTPCode_ELB_5XX_Count")
+
+    def test_event_refresh_can_collect_late_new_instance_cpu(self):
+        start = datetime.fromisoformat("2026-10-24T15:13:44+00:00")
+        end = datetime.fromisoformat("2026-10-24T15:14:14+00:00")
+        first = datetime.fromisoformat("2026-10-24T15:13:00+00:00")
+        second = datetime.fromisoformat("2026-10-24T15:14:00+00:00")
+        files = cloudwatch.requested_metrics(SimpleNamespace(
+            instances=["i-old", "i-new"], alb="app/product-alb/xyz", rds=None,
+            event_metrics=True))
+
+        def metrics(count, values):
+            return {"MetricDataResults": [
+                {"Id": f"m{index}", "StatusCode": "Complete",
+                 "Timestamps": [first, second][:len(series)], "Values": series}
+                for index, series in enumerate(values[:count])]}
+
+        client = Client([
+            metrics(2, [[12], []]),
+            metrics(5, [[], [], [15], [], []]),
+            metrics(2, [[12, 11], [17]]),
+            metrics(5, [[], [], [15, 16], [], []]),
+        ])
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+                cloudwatch.time, "sleep", return_value=None):
+            cloudwatch.export(client, files, start, end, Path(temporary), refresh_all=True)
+            with (Path(temporary) / "ec2_cpu.csv").open(newline="") as source:
+                ids = {row["resource_id"] for row in csv.DictReader(source)}
+        self.assertEqual(ids, {"i-old", "i-new"})
+
 
 if __name__ == "__main__":
     unittest.main()
