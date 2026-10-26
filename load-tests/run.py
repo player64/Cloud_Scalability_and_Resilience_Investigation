@@ -257,6 +257,13 @@ def run_k6(
         "-e", f"VUS={workload['preallocated_vus']}",
         str(WORKLOAD),
     ]
+    metadata["k6_command"] = command
+    metadata["k6_environment"] = {
+        "ALB_URL": resources["alb_url"],
+        "RATE": str(workload["rate_per_second"]),
+        "DURATION": workload["duration"],
+        "VUS": str(workload["preallocated_vus"]),
+    }
     try:
         with (directory / "k6.txt").open("w", encoding="utf-8") as log:
             metadata["test_start_utc"] = utc_now().isoformat()
@@ -327,7 +334,7 @@ def collect_cloudwatch(
             f"{metadata['cloudwatch_error']}; {reason}"
             if metadata.get("cloudwatch_error") else reason
         )
-    metadata["status"] = "running" if complete else "failed"
+    metadata["status"] = "running" if complete and metadata["status"] != "failed" else "failed"
     save_metadata(directory, metadata)
     return complete
 
@@ -447,13 +454,19 @@ def main() -> int:
     directory, metadata = setup_experiment(
         args.outputs, resources, args.rate, args.duration, args.vus
     )
-    run_k6(directory, resources, metadata)
+    k6_succeeded = run_k6(directory, resources, metadata)
     if (metadata["test_start_utc"] and metadata["test_end_utc"]
             and datetime.fromisoformat(metadata["test_end_utc"])
             > datetime.fromisoformat(metadata["test_start_utc"])):
         cloudwatch_complete = collect_cloudwatch(directory, resources, metadata)
-        reconcile_requests(directory, resources, metadata, cloudwatch_complete,
-                           args.reconcile_timeout, args.reconcile_delay)
+        if k6_succeeded:
+            reconcile_requests(directory, resources, metadata, cloudwatch_complete,
+                               args.reconcile_timeout, args.reconcile_delay)
+        else:
+            metadata["reconciliation"]["status"] = "skipped"
+            metadata["reconciliation"]["reason"] = "k6 execution was unsuccessful"
+            metadata["status"] = "failed"
+            save_metadata(directory, metadata)
     else:
         metadata["cloudwatch_error"] = "CloudWatch export skipped: valid test timestamps unavailable"
         metadata["status"] = "failed"

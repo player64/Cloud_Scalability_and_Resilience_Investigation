@@ -199,6 +199,11 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(cloudwatch_exists)
         self.assertEqual((metadata["status"], metadata["k6_exit_code"],
                            metadata["cloudwatch_exit_code"]), ("completed", 0, 0))
+        self.assertEqual(metadata["k6_command"], k6)
+        self.assertEqual(metadata["k6_environment"], {
+            "ALB_URL": OUTPUTS["alb_url"], "RATE": str(runner.REQUEST_RATE),
+            "DURATION": runner.DURATION, "VUS": str(runner.VUS),
+        })
         self.assertEqual(metadata["reconciliation"], {
             "status": "matched", "k6_requests": 31, "alb_requests": 31,
             "difference": 0, "attempts": 1,
@@ -271,6 +276,10 @@ class RunnerTests(unittest.TestCase):
         )
         self.assertEqual(result, 0)
         self.assertEqual(metadata["workload"], workload)
+        self.assertEqual(metadata["k6_command"], calls[0])
+        self.assertEqual(metadata["k6_environment"], {
+            "ALB_URL": OUTPUTS["alb_url"], "RATE": "12", "DURATION": "5m", "VUS": "20",
+        })
         self.assertEqual([calls[0][index + 1] for index, value in enumerate(calls[0])
                           if value == "-e"], [
             f"ALB_URL={OUTPUTS['alb_url']}", "RATE=12", "DURATION=5m", "VUS=20",
@@ -298,7 +307,9 @@ class RunnerTests(unittest.TestCase):
                 self.assertFalse((root / "evidence").exists())
 
     def test_k6_failure_still_collects_cloudwatch(self):
-        result, calls, metadata, cloudwatch_exists = self.run_workflow(k6_code=7)
+        result, calls, metadata, cloudwatch_exists = self.run_workflow(
+            k6_code=7, alb_counts=(29,),
+        )
         self.assertEqual(result, 1)
         self.assertEqual(len(calls), 2)
         self.assertEqual(metadata["status"], "failed")
@@ -306,7 +317,15 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(metadata["cloudwatch_exit_code"], 0)
         self.assertIn("k6 exited with code 7", metadata["workload_error"])
         self.assertIsNone(metadata["cloudwatch_error"])
-        self.assertEqual(metadata["reconciliation"]["status"], "matched")
+        self.assertEqual(metadata["reconciliation"], {
+            "status": "skipped", "k6_requests": None, "alb_requests": None,
+            "difference": None, "attempts": 0,
+            "reason": "k6 execution was unsuccessful",
+        })
+        self.assertEqual(metadata["k6_command"], calls[0])
+        self.assertEqual(metadata["k6_environment"], {
+            "ALB_URL": OUTPUTS["alb_url"], "RATE": "1", "DURATION": "30s", "VUS": "2",
+        })
         self.assertTrue(cloudwatch_exists)
 
     def test_cloudwatch_failure_preserves_partial_evidence(self):
