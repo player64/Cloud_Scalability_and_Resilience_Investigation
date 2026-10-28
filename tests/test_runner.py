@@ -24,6 +24,7 @@ OUTPUTS = {
     "target_group_arn": "arn:aws:elasticloadbalancing:eu-west-1:123:targetgroup/products/abc",
     "rds_identifier": "product-db",
     "experiment_profile": "baseline",
+    "evidence_bucket": "test-evidence-bucket",
 }
 RESOURCES = {
     **OUTPUTS,
@@ -46,7 +47,8 @@ class RunnerTests(unittest.TestCase):
 
             for invalid in ({**OUTPUTS, "alb_url": ""},
                             {key: value for key, value in OUTPUTS.items() if key != "target_group_arn"},
-                            {key: value for key, value in OUTPUTS.items() if key != "experiment_profile"}):
+                            {key: value for key, value in OUTPUTS.items() if key != "experiment_profile"},
+                            {key: value for key, value in OUTPUTS.items() if key != "evidence_bucket"}):
                 with self.subTest(invalid=invalid):
                     write_outputs(path, invalid)
                     with self.assertRaises(ValueError):
@@ -85,7 +87,7 @@ class RunnerTests(unittest.TestCase):
     def run_workflow(self, k6_code=0, cloudwatch_code=0, valid_k6=True,
                      valid_cloudwatch=True, cli_args=(), expected_workload=None,
                      alb_counts=(31,), refresh_error=False, clock=None,
-                     include_request_count=True):
+                     include_request_count=True, upload_error=False):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             outputs = root / "outputs.json"
@@ -138,6 +140,8 @@ class RunnerTests(unittest.TestCase):
             terminal = io.StringIO()
             with (patch.object(runner, "ROOT", root),
                   patch.object(runner, "discover_resources", return_value=RESOURCES),
+                  patch.object(runner, "upload_evidence",
+                               side_effect=RuntimeError("S3 unavailable") if upload_error else None) as upload,
                   patch.object(runner.subprocess, "run", side_effect=subprocess_result),
                   patch.object(runner.time, "sleep", return_value=None),
                    patch.object(sys, "argv", [str(RUNNER_PATH), "--outputs", str(outputs),
@@ -150,6 +154,7 @@ class RunnerTests(unittest.TestCase):
                     with patch.object(runner.time, "monotonic", side_effect=clock):
                         result = runner.main()
             after = datetime.now(timezone.utc)
+            upload.assert_called_once()
             directories = list((root / "evidence").iterdir())
             self.assertEqual(len(directories), 1)
             evidence = directories[0]
@@ -181,6 +186,33 @@ class RunnerTests(unittest.TestCase):
                 f"{workload['preallocated_vus']} VUs", summary,
             )
             return result, calls, metadata, (evidence / "ec2_cpu.csv").exists()
+
+    def test_upload_evidence_preserves_partial_files_and_final_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "evidence" / "baseline-run"
+            (directory / "reconciliation").mkdir(parents=True)
+            (directory / "k6.csv").write_text("partial csv\n")
+            (directory / "reconciliation" / "cloudwatch.txt").write_text("error\n")
+            metadata = {"status": "failed"}
+            client = MagicMock()
+            boto3 = SimpleNamespace(client=MagicMock(return_value=client))
+            with patch.dict(sys.modules, {"boto3": boto3}):
+                runner.upload_evidence(directory, metadata, "test-evidence-bucket", "eu-west-1")
+            keys = [call.args[2] for call in client.upload_file.call_args_list]
+            self.assertEqual(keys, [
+                "evidence/baseline-run/k6.csv",
+                "evidence/baseline-run/reconciliation/cloudwatch.txt",
+                "evidence/baseline-run/run.json",
+            ])
+            self.assertEqual(json.loads((directory / "run.json").read_text())["evidence_upload"],
+                             {"status": "completed", "error": None})
+
+    def test_upload_failure_preserves_completed_run_and_reports_error(self):
+        result, _, metadata, _ = self.run_workflow(upload_error=True)
+        self.assertEqual(result, 1)
+        self.assertEqual(metadata["status"], "completed")
+        self.assertEqual(metadata["evidence_upload"],
+                         {"status": "failed", "error": "RuntimeError: S3 unavailable"})
 
     def test_successful_workflow(self):
         result, calls, metadata, cloudwatch_exists = self.run_workflow()

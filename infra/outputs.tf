@@ -53,6 +53,26 @@ output "artifact_bucket" {
   value       = aws_s3_bucket.artifacts.id
 }
 
+output "evidence_bucket" {
+  description = "Disposable S3 bucket for load-test evidence; destroy empties it."
+  value       = aws_s3_bucket.evidence.id
+}
+
+output "aws_region" {
+  description = "Region for the student-operated evidence sync."
+  value       = var.aws_region
+}
+
+output "load_generator_public_ip" {
+  description = "Public IPv4 address for SSH and SCP to the load generator."
+  value       = aws_instance.load_generator.public_ip
+}
+
+output "load_generator_ami_id" {
+  description = "Pinned Ubuntu AMI used by the load generator."
+  value       = data.aws_ami.load_generator.id
+}
+
 output "product_jar_key" {
   description = "Immutable S3 object key for the Product Service JAR."
   value       = aws_s3_object.product_jar.key

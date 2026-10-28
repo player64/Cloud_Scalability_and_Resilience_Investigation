@@ -104,7 +104,7 @@ variable "db_user" {
   nullable    = false
 
   validation {
-    condition = can(regex("^[a-zA-Z][a-zA-Z0-9]{0,15}$", var.db_user))
+    condition     = can(regex("^[a-zA-Z][a-zA-Z0-9]{0,15}$", var.db_user))
     error_message = "Username must start with a letter, contain only alphanumeric characters, and be 1–16 characters long."
   }
 
@@ -209,6 +209,24 @@ variable "product_instance_type" {
   description = "Approved x86_64 EC2 type for Product instances; keep fixed across experiments."
   type        = string
   default     = "t3.micro"
+  nullable    = false
+}
+
+variable "load_generator_ami_id" {
+  description = "Pinned official Canonical Ubuntu Server 24.04 LTS x86_64 AMI ID in aws_region."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^ami-[0-9a-f]{17}$", var.load_generator_ami_id))
+    error_message = "load_generator_ami_id must be a literal regional AMI ID."
+  }
+}
+
+variable "load_generator_instance_type" {
+  description = "x86_64 EC2 type for the load generator; keep fixed across matched experiments."
+  type        = string
+  default     = "t3.small"
   nullable    = false
 }
 

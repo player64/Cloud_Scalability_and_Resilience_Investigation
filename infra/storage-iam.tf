@@ -75,6 +75,64 @@ resource "aws_s3_object" "coupon_jar" {
   ]
 }
 
+resource "aws_s3_object" "load_tests" {
+  for_each = toset([
+    "run.py", "observe.py", "cloudwatch.py", "experiments.py",
+    "product.js", "product-ramp.js",
+  ])
+
+  bucket      = aws_s3_bucket.artifacts.id
+  key         = "load-tests/${each.key}"
+  source      = "${path.module}/../load-tests/${each.key}"
+  source_hash = filebase64sha256("${path.module}/../load-tests/${each.key}")
+
+  metadata = {
+    sha256 = filesha256("${path.module}/../load-tests/${each.key}")
+  }
+
+  depends_on = [
+    aws_s3_bucket_ownership_controls.artifacts,
+    aws_s3_bucket_public_access_block.artifacts,
+    aws_s3_bucket_server_side_encryption_configuration.artifacts,
+  ]
+}
+
+resource "aws_s3_bucket" "evidence" {
+  bucket_prefix = "${local.name_prefix}-evidence-"
+  force_destroy = true
+
+  tags = {
+    Name = "${local.name_prefix}-evidence"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "evidence" {
+  bucket = aws_s3_bucket.evidence.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_ownership_controls" "evidence" {
+  bucket = aws_s3_bucket.evidence.id
+
+  rule {
+    object_ownership = "BucketOwnerEnforced"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "evidence" {
+  bucket = aws_s3_bucket.evidence.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
 resource "aws_ssm_parameter" "db_admin_password" {
   name   = "/${local.name_prefix}/db/admin-password"
   type   = "SecureString"

@@ -1,0 +1,39 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+export DEBIAN_FRONTEND=noninteractive
+export AWS_DEFAULT_REGION='${region}' AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=5
+export AWS_PAGER=''
+
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl gnupg unzip python3-venv
+
+curl -fsSL https://dl.k6.io/key.gpg | gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
+printf '%s\n' 'deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main' > /etc/apt/sources.list.d/k6.list
+chmod 0644 /usr/share/keyrings/k6-archive-keyring.gpg /etc/apt/sources.list.d/k6.list
+apt-get update
+apt-get install -y --no-install-recommends k6
+
+curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp/awscli-install
+/tmp/awscli-install/aws/install
+
+install -d -o ubuntu -g ubuntu -m 0700 /home/ubuntu/ca1
+install -d -o ubuntu -g ubuntu -m 0700 /home/ubuntu/ca1/load-tests
+install -d -o ubuntu -g ubuntu -m 0700 /home/ubuntu/ca1/infra
+install -d -o ubuntu -g ubuntu -m 0700 /home/ubuntu/ca1/evidence
+
+timeout 180 aws s3 cp 's3://${bucket}/load-tests/' /home/ubuntu/ca1/load-tests/ --recursive --only-show-errors
+python3 -m venv /home/ubuntu/ca1/.venv
+/home/ubuntu/ca1/.venv/bin/pip install --disable-pip-version-check boto3
+
+cd /home/ubuntu/ca1
+sha256sum load-tests/*.py load-tests/*.js > framework.sha256
+{
+  python3 --version
+  /home/ubuntu/ca1/.venv/bin/python -m pip show boto3 | sed -n 's/^Version: /boto3 /p'
+  k6 version
+  aws --version
+} > software-versions.txt 2>&1
+chown -R ubuntu:ubuntu /home/ubuntu/ca1

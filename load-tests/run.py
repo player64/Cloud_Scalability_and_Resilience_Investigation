@@ -74,6 +74,7 @@ def load_infrastructure_outputs(path: Path) -> dict[str, str]:
         "target_group_arn": output_value(outputs, "target_group_arn"),
         "rds_identifier": output_value(outputs, "rds_identifier"),
         "experiment_profile": output_value(outputs, "experiment_profile"),
+        "evidence_bucket": output_value(outputs, "evidence_bucket"),
     }
 
 
@@ -128,6 +129,24 @@ def save_metadata(directory: Path, metadata: dict[str, Any]) -> None:
     (directory / "run.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
+
+
+def upload_evidence(directory: Path, metadata: dict[str, Any], bucket: str,
+                    region: str) -> None:
+    """Upload every available run file, including partial evidence on failure."""
+    import boto3
+
+    metadata["evidence_upload"] = {"status": "running", "error": None}
+    save_metadata(directory, metadata)
+    client = boto3.client("s3", region_name=region)
+    prefix = f"evidence/{directory.name}/"
+    for path in sorted(directory.rglob("*")):
+        if path.is_file() and path != directory / "run.json":
+            client.upload_file(str(path), bucket,
+                               prefix + path.relative_to(directory).as_posix())
+    metadata["evidence_upload"]["status"] = "completed"
+    save_metadata(directory, metadata)
+    client.upload_file(str(directory / "run.json"), bucket, prefix + "run.json")
 
 
 def evidence_rows(path: Path, required: set[str]) -> bool:
@@ -462,8 +481,81 @@ def reconcile_requests(directory: Path, resources: dict[str, str],
     save_metadata(directory, metadata)
 
 
+def execute_experiment(args: argparse.Namespace, resources: dict[str, str],
+                       directory: Path, metadata: dict[str, Any],
+                       experiment: str) -> int:
+    """Run a prepared experiment, leaving its local evidence intact."""
+    observer = None
+    if experiment != "baseline":
+        try:
+            import boto3
+            observer = Observer(boto3.Session(region_name=resources["region"]),
+                                resources["product_asg_name"], resources["target_group_arn"],
+                                directory / "aws_observations.jsonl", args.observe_interval)
+            observer.start()
+        except Exception as error:
+            metadata["status"] = "failed"
+            metadata["observation"] = {"status": "start_failed", "error": str(error),
+                                       "samples": 0, "errors": 0, "instance_ids": []}
+            save_metadata(directory, metadata)
+            print(f"AWS observation could not start: {type(error).__name__}; evidence: {directory}")
+            return 1
+        if experiment == "failure":
+            print("Failure injection is manual. Record action start/end UTC times and the selected "
+                  "instance ID in this evidence directory; the runner never terminates an instance.",
+                  flush=True)
+    try:
+        k6_succeeded = run_k6(directory, resources, metadata)
+    finally:
+        if observer is not None:
+            stopped = observer.stop()
+            metadata["observation"] = {
+                "status": "completed" if stopped and observer.samples and not observer.errors
+                          else "partial",
+                "samples": observer.samples, "errors": observer.errors,
+                "instance_ids": sorted(observer.seen_ids),
+            }
+            resources["product_instance_ids"] = sorted(
+                set(resources["product_instance_ids"]) | observer.seen_ids)
+            save_metadata(directory, metadata)
+    if (metadata["test_start_utc"] and metadata["test_end_utc"]
+            and datetime.fromisoformat(metadata["test_end_utc"])
+            > datetime.fromisoformat(metadata["test_start_utc"])):
+        cloudwatch_complete = collect_cloudwatch(directory, resources, metadata)
+        if k6_succeeded or experiment != "baseline":
+            reconcile_requests(directory, resources, metadata, cloudwatch_complete,
+                               args.reconcile_timeout, args.reconcile_delay)
+        else:
+            metadata["reconciliation"]["status"] = "skipped"
+            metadata["reconciliation"]["reason"] = "k6 execution was unsuccessful"
+            metadata["status"] = "failed"
+            save_metadata(directory, metadata)
+    else:
+        metadata["cloudwatch_error"] = "CloudWatch export skipped: valid test timestamps unavailable"
+        metadata["status"] = "failed"
+        metadata["reconciliation"]["status"] = "unavailable"
+        save_metadata(directory, metadata)
+
+    if observer is not None and metadata["observation"]["status"] != "completed":
+        metadata["status"] = "failed"
+        save_metadata(directory, metadata)
+
+    workload = metadata["workload"]
+    print(f"Experiment: {metadata['experiment']} | {workload['rate_per_second']} req/s | "
+          f"{workload['duration']} | {workload['preallocated_vus']} VUs")
+    k6_detail = f" ({metadata['workload_error']})" if metadata["workload_error"] else ""
+    cloudwatch_detail = (
+        f" ({metadata['cloudwatch_error']})" if metadata["cloudwatch_error"] else ""
+    )
+    print(f"k6: exit {metadata['k6_exit_code']}{k6_detail}")
+    print(f"CloudWatch: exit {metadata['cloudwatch_exit_code']}{cloudwatch_detail}")
+    print(f"Status: {metadata['status']}")
+    print(f"Evidence: {directory}")
+    return 0 if metadata["status"] == "completed" else 1
+
+
 def main() -> int:
-    """Coordinate a student-run trial and report its evidence directory."""
+    """Coordinate a student-run trial and upload its evidence directory."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rate", type=positive_integer, default=REQUEST_RATE,
                         help="requests per second (default: 1)")
@@ -513,71 +605,32 @@ def main() -> int:
         args.outputs, resources, args.rate, args.duration, args.vus,
         experiment, ramp,
     )
-    observer = None
-    if experiment != "baseline":
+    try:
+        result = execute_experiment(args, resources, directory, metadata, experiment)
+    except KeyboardInterrupt:
+        metadata["status"] = "failed"
+        metadata["runner_error"] = "Interrupted by operator"
+        save_metadata(directory, metadata)
+        result = 130
+    except Exception as error:
+        metadata["status"] = "failed"
+        metadata["runner_error"] = f"{type(error).__name__}: {error}"
+        save_metadata(directory, metadata)
+        print(f"Experiment failed: {type(error).__name__}; evidence: {directory}")
+        result = 1
+    finally:
         try:
-            import boto3
-            observer = Observer(boto3.Session(region_name=resources["region"]),
-                                resources["product_asg_name"], resources["target_group_arn"],
-                                directory / "aws_observations.jsonl", args.observe_interval)
-            observer.start()
+            upload_evidence(directory, metadata, infrastructure["evidence_bucket"],
+                            resources["region"])
+            print(f"Evidence uploaded: s3://{infrastructure['evidence_bucket']}/evidence/{directory.name}/")
         except Exception as error:
-            metadata["status"] = "failed"
-            metadata["observation"] = {"status": "start_failed", "error": str(error),
-                                       "samples": 0, "errors": 0, "instance_ids": []}
+            metadata["evidence_upload"] = {
+                "status": "failed", "error": f"{type(error).__name__}: {error}",
+            }
             save_metadata(directory, metadata)
-            print(f"AWS observation could not start: {type(error).__name__}; evidence: {directory}")
-            return 1
-        if experiment == "failure":
-            print("Failure injection is manual. Record action start/end UTC times and the selected "
-                  "instance ID in this evidence directory; the runner never terminates an instance.",
-                  flush=True)
-    k6_succeeded = run_k6(directory, resources, metadata)
-    if observer is not None:
-        stopped = observer.stop()
-        metadata["observation"] = {
-            "status": "completed" if stopped and observer.samples and not observer.errors
-                      else "partial",
-            "samples": observer.samples, "errors": observer.errors,
-            "instance_ids": sorted(observer.seen_ids),
-        }
-        resources["product_instance_ids"] = sorted(
-            set(resources["product_instance_ids"]) | observer.seen_ids)
-        save_metadata(directory, metadata)
-    if (metadata["test_start_utc"] and metadata["test_end_utc"]
-            and datetime.fromisoformat(metadata["test_end_utc"])
-            > datetime.fromisoformat(metadata["test_start_utc"])):
-        cloudwatch_complete = collect_cloudwatch(directory, resources, metadata)
-        if k6_succeeded or experiment != "baseline":
-            reconcile_requests(directory, resources, metadata, cloudwatch_complete,
-                               args.reconcile_timeout, args.reconcile_delay)
-        else:
-            metadata["reconciliation"]["status"] = "skipped"
-            metadata["reconciliation"]["reason"] = "k6 execution was unsuccessful"
-            metadata["status"] = "failed"
-            save_metadata(directory, metadata)
-    else:
-        metadata["cloudwatch_error"] = "CloudWatch export skipped: valid test timestamps unavailable"
-        metadata["status"] = "failed"
-        metadata["reconciliation"]["status"] = "unavailable"
-        save_metadata(directory, metadata)
-
-    if observer is not None and metadata["observation"]["status"] != "completed":
-        metadata["status"] = "failed"
-        save_metadata(directory, metadata)
-
-    workload = metadata["workload"]
-    print(f"Experiment: {metadata['experiment']} | {workload['rate_per_second']} req/s | "
-          f"{workload['duration']} | {workload['preallocated_vus']} VUs")
-    k6_detail = f" ({metadata['workload_error']})" if metadata["workload_error"] else ""
-    cloudwatch_detail = (
-        f" ({metadata['cloudwatch_error']})" if metadata["cloudwatch_error"] else ""
-    )
-    print(f"k6: exit {metadata['k6_exit_code']}{k6_detail}")
-    print(f"CloudWatch: exit {metadata['cloudwatch_exit_code']}{cloudwatch_detail}")
-    print(f"Status: {metadata['status']}")
-    print(f"Evidence: {directory}")
-    return 0 if metadata["status"] == "completed" else 1
+            print(f"Evidence upload failed: {type(error).__name__}; local evidence: {directory}")
+            result = 1
+    return result
 
 
 if __name__ == "__main__":
