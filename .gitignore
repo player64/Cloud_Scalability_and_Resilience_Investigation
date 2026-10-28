@@ -19,3 +19,4 @@ infra/outputs.json
 /evidence-*/
 /load-tests/**/*.local.json
 /load-tests/*.local.json
+/charts/
