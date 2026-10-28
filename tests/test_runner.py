@@ -274,9 +274,22 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(metadata["reconciliation"], {
             "status": "timeout", "k6_requests": 31, "alb_requests": 30,
             "difference": -1, "attempts": 2,
+            "reason": "ALB RequestCount did not reconcile before timeout",
         })
-        self.assertIn("did not reconcile", metadata["cloudwatch_error"])
+        self.assertIsNone(metadata["cloudwatch_error"])
         self.assertIn("RequestCount,Sum,30,Count", self.last_evidence["alb_metrics.csv"])
+
+    def test_extra_alb_requests_fail_fast_without_blame_on_cloudwatch(self):
+        result, calls, metadata, _ = self.run_workflow(alb_counts=(36,))
+        self.assertEqual(result, 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(metadata["status"], "failed")
+        self.assertEqual(metadata["cloudwatch_exit_code"], 0)
+        self.assertIsNone(metadata["cloudwatch_error"])
+        self.assertEqual(metadata["reconciliation"]["status"], "mismatch")
+        self.assertEqual(metadata["reconciliation"]["difference"], 5)
+        self.assertEqual(metadata["reconciliation"]["attempts"], 1)
+        self.assertIn("overlapping", metadata["reconciliation"]["reason"])
 
     def test_refresh_failure_retains_diagnostic_and_original_export(self):
         result, calls, metadata, _ = self.run_workflow(

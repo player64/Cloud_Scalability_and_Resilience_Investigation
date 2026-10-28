@@ -420,6 +420,13 @@ def reconcile_requests(directory: Path, resources: dict[str, str],
             if result["difference"] == 0:
                 result["status"] = "matched"
                 break
+            if result["difference"] > 0:
+                result["status"] = "mismatch"
+                result["reason"] = (
+                    "ALB counted more requests than k6; check other traffic and "
+                    "the overlapping first/last CloudWatch minute buckets"
+                )
+                break
         if result["k6_requests"] is None:
             break
         remaining = deadline - time.monotonic()
@@ -472,7 +479,7 @@ def reconcile_requests(directory: Path, resources: dict[str, str],
             break
 
     if result["status"] == "timeout" and not metadata["cloudwatch_error"]:
-        metadata["cloudwatch_error"] = "ALB RequestCount did not reconcile before timeout"
+        result["reason"] = "ALB RequestCount did not reconcile before timeout"
     metadata["status"] = (
         "completed" if result["status"] == "matched"
         and metadata["k6_exit_code"] == 0 and not metadata["workload_error"]
@@ -549,6 +556,10 @@ def execute_experiment(args: argparse.Namespace, resources: dict[str, str],
     )
     print(f"k6: exit {metadata['k6_exit_code']}{k6_detail}")
     print(f"CloudWatch: exit {metadata['cloudwatch_exit_code']}{cloudwatch_detail}")
+    reconciliation = metadata["reconciliation"]
+    print(f"ALB reconciliation: {reconciliation['status']} "
+          f"(difference: {reconciliation['difference']}); "
+          f"{reconciliation.get('reason', '')}")
     print(f"Status: {metadata['status']}")
     print(f"Evidence: {directory}")
     return 0 if metadata["status"] == "completed" else 1
