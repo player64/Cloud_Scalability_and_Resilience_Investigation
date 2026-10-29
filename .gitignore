@@ -20,3 +20,4 @@ infra/outputs.json
 /load-tests/**/*.local.json
 /load-tests/*.local.json
 /charts/
+report/out/

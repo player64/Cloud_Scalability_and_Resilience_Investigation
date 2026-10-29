@@ -19,6 +19,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
        terraform \
        nodejs \
+       latexmk \
+       texlive-latex-extra \
+       texlive-fonts-recommended \
+       texlive-bibtex-extra \
+       biber \
+       python3-pygments \
     && rm -rf /var/lib/apt/lists/*
 
 USER vscode
