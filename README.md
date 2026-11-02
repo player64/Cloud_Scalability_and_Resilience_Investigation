@@ -348,11 +348,15 @@ ls evidence/
 
 Keep HTTP failures separate from dropped iterations. Compare completed and HTTP 200 requests per second, p95 from individual latency samples, and CPU over aligned UTC windows. Do not average p95 values. CloudWatch minute buckets can include adjacent traffic; investigate count mismatches and missing data. Healthy-target observations do not identify the first successful response from a replacement.
 
-For optional local charts, install Python 3 with venv support, then run from the repository root:
-
+For local Python scripts and optional charts, install Python 3 with venv support. From the repository root, create a virtual environment and install the dependencies in `requirements.txt`:
 ```bash
 python3 -m venv .venv
-./.venv/bin/python -m pip install pandas matplotlib
+./.venv/bin/python -m pip install -r requirements.txt
+```
+
+
+Then generate charts with:
+```bash
 ./.venv/bin/python load-tests/charts.py \
   "evidence/<baseline-run-id>" "evidence/<scaled-run-id>" \
   --output-dir "charts/<new-comparison-name>"
